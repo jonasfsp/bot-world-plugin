@@ -251,7 +251,7 @@ describe('Bot World v0.8.0 — Bot RPG, Desk Props, Owner Roaming, Banter & Desk
       screenshots: unknown[];
       contributes: { settings: Array<{ key: string; default: unknown }> };
     };
-    assert.equal(manifest.version, '1.0.0');
+    assert.match(manifest.version, /^1\.0\.0(-autoseller\.\d+)?$/);
     assert.ok(manifest.capabilities.some((c) => c.kind === 'notifications:show'));
     assert.ok(manifest.screenshots.length <= 6);
     const quickSendSetting = manifest.contributes.settings.find((s) => s.key === 'allowQuickSend');

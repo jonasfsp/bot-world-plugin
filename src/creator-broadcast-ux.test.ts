@@ -375,7 +375,7 @@ describe('Bot World v0.9.0 — Creator Studio, Broadcast Bar, Hover Tooltips & A
       screenshots: unknown[];
       contributes: { settings: Array<{ key: string; enum?: string[]; default: unknown }> };
     };
-    assert.equal(manifest.version, '1.0.0');
+    assert.match(manifest.version, /^1\.0\.0(-autoseller\.\d+)?$/);
     assert.equal(manifest.capabilities.length, 5);
     assert.equal(manifest.screenshots.length, 6);
     const vmSetting = manifest.contributes.settings.find((s) => s.key === 'viewMode');

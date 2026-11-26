@@ -9,6 +9,10 @@ import {
   assertAllowedSubcommand,
   buildMinimalSafeEnv,
   discoverOrcaBinary,
+  discoverOrcaBinaryWithReport,
+  formatDiscoveryReport,
+  sendQuickBotMessage,
+  setOrcaCliDiagnosticLogger,
   getDefaultOrcaCandidates,
   clampLimit,
   validateBotName,
@@ -508,6 +512,192 @@ describe('OrcaCli cross-platform CLI discovery', () => {
       );
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('OrcaCli Windows reduced worker env & diagnostics', () => {
+  // Exactly the keys Orca's main process passes to a forked plugin worker on Windows.
+  const WORKER_ENV = {
+    PATH: 'C:\\Windows\\System32;C:\\Windows',
+    USERPROFILE: 'C:\\Users\\tester',
+    SystemRoot: 'C:\\Windows',
+    SYSTEMDRIVE: 'C:',
+    WINDIR: 'C:\\Windows',
+    TEMP: 'C:\\Users\\tester\\AppData\\Local\\Temp',
+    TMP: 'C:\\Users\\tester\\AppData\\Local\\Temp',
+    COMSPEC: 'C:\\Windows\\System32\\cmd.exe',
+    PATHEXT: '.COM;.EXE;.BAT;.CMD',
+    ELECTRON_RUN_AS_NODE: '1',
+    GIT_TERMINAL_PROMPT: '0',
+  };
+  const USER_INSTALL = 'C:\\Users\\tester\\AppData\\Local\\Programs\\Orca';
+  const USER_EXE = `${USER_INSTALL}\\resources\\bin\\orca.exe`;
+  const MACHINE_INSTALL = 'C:\\Program Files\\Orca';
+  const MACHINE_EXE = `${MACHINE_INSTALL}\\resources\\bin\\orca.exe`;
+
+  test('finds orca.exe from process.execPath without LOCALAPPDATA/ORCA_CLI_COMMAND', () => {
+    const user = discoverOrcaBinaryWithReport({
+      platform: 'win32',
+      env: WORKER_ENV,
+      homeDir: null,
+      execPath: `${USER_INSTALL}\\Orca.exe`,
+      windowsFs: fakeWindowsFs({ [USER_EXE]: USER_EXE }),
+    });
+    assert.equal(user.path, USER_EXE);
+    assert.equal(user.attempts[0].candidate, USER_EXE);
+
+    // Machine-wide install: ProgramFiles is not in the worker env either.
+    const machine = discoverOrcaBinary({
+      platform: 'win32',
+      env: WORKER_ENV,
+      homeDir: null,
+      execPath: `${MACHINE_INSTALL}\\Orca.exe`,
+      windowsFs: fakeWindowsFs({ [MACHINE_EXE]: MACHINE_EXE }),
+    });
+    assert.equal(machine, MACHINE_EXE);
+  });
+
+  test('finds orca.exe from USERPROFILE or os.homedir() when execPath does not help', () => {
+    const viaProfile = discoverOrcaBinary({
+      platform: 'win32',
+      env: WORKER_ENV,
+      homeDir: null,
+      execPath: 'D:\\tools\\node\\node.exe',
+      windowsFs: fakeWindowsFs({ [USER_EXE]: USER_EXE }),
+    });
+    assert.equal(viaProfile, USER_EXE);
+
+    const { USERPROFILE: _omit, ...noProfile } = WORKER_ENV;
+    const viaHomedir = discoverOrcaBinary({
+      platform: 'win32',
+      env: noProfile,
+      homeDir: 'C:\\Users\\tester',
+      execPath: null,
+      windowsFs: fakeWindowsFs({ [USER_EXE]: USER_EXE }),
+    });
+    assert.equal(viaHomedir, USER_EXE);
+  });
+
+  test('still rejects candidates whose realpath leaves the derived roots', () => {
+    const report = discoverOrcaBinaryWithReport({
+      platform: 'win32',
+      env: WORKER_ENV,
+      homeDir: null,
+      execPath: 'C:\\Orca\\Orca.exe',
+      windowsFs: fakeWindowsFs({
+        'C:\\Orca\\resources\\bin\\orca.exe': 'D:\\evil\\orca.exe',
+        [USER_EXE]: 'D:\\evil\\orca.exe',
+      }),
+    });
+    assert.equal(report.path, null);
+    assert.deepEqual(
+      report.attempts.map((a) => a.result),
+      ['outside_trusted_roots', 'outside_trusted_roots']
+    );
+
+    // UNC execPath is ignored entirely; nothing else installed -> not found
+    const unc = discoverOrcaBinaryWithReport({
+      platform: 'win32',
+      env: {},
+      homeDir: null,
+      execPath: '\\\\server\\share\\Orca.exe',
+      windowsFs: fakeWindowsFs({ '\\\\server\\share\\resources\\bin\\orca.exe': '\\\\server\\share\\resources\\bin\\orca.exe' }),
+    });
+    assert.equal(unc.path, null);
+    assert.equal(unc.attempts.length, 0);
+  });
+
+  test('derives APPDATA/LOCALAPPDATA for the CLI only when missing', () => {
+    const env = buildMinimalSafeEnv(WORKER_ENV, 'win32', null);
+    assert.equal(env.APPDATA, 'C:\\Users\\tester\\AppData\\Roaming');
+    assert.equal(env.LOCALAPPDATA, 'C:\\Users\\tester\\AppData\\Local');
+    assert.equal(env.USERPROFILE, 'C:\\Users\\tester');
+    assert.equal(env.SystemRoot, 'C:\\Windows');
+    assert.equal(env.ELECTRON_RUN_AS_NODE, undefined);
+    assert.equal(env.COMSPEC, undefined);
+
+    const explicit = buildMinimalSafeEnv({ ...WORKER_ENV, APPDATA: 'E:\\Roaming' }, 'win32', null);
+    assert.equal(explicit.APPDATA, 'E:\\Roaming');
+
+    const { USERPROFILE: _omit, SystemRoot: _sr, ...bare } = WORKER_ENV;
+    const fromHome = buildMinimalSafeEnv(bare, 'win32', 'C:\\Users\\other');
+    assert.equal(fromHome.USERPROFILE, 'C:\\Users\\other');
+    assert.equal(fromHome.APPDATA, 'C:\\Users\\other\\AppData\\Roaming');
+    assert.equal(fromHome.SystemRoot, 'C:\\Windows');
+
+    // Never derived from a non-absolute home
+    const relHome = buildMinimalSafeEnv({ PATH: 'C:\\Windows' }, 'win32', 'relative\\home');
+    assert.equal(relHome.APPDATA, undefined);
+
+    // Case-insensitive lookup of upper-cased keys from the forked env
+    const upper = buildMinimalSafeEnv({ SYSTEMROOT: 'C:\\Windows', USERPROFILE: 'C:\\Users\\u' }, 'win32', null);
+    assert.equal(upper.SystemRoot, 'C:\\Windows');
+  });
+
+  test('diagnostic line reports env presence only, never env values or secrets', () => {
+    const report = discoverOrcaBinaryWithReport({
+      platform: 'win32',
+      env: {
+        ...WORKER_ENV,
+        APPDATA: 'C:\\Users\\tester\\AppData\\Roaming\\SECRET-APPDATA',
+        ORCA_BOT_TOOLS_TOKEN: 'tok-SECRET',
+      },
+      homeDir: null,
+      execPath: 'C:\\Orca\\Orca.exe',
+      windowsFs: fakeWindowsFs({}),
+    });
+    const line = formatDiscoveryReport(report);
+    assert.ok(line.includes('platform=win32'), line);
+    assert.ok(line.includes('LOCALAPPDATA=unset'), line);
+    assert.ok(line.includes('ProgramFiles=unset'), line);
+    assert.ok(line.includes('ORCA_CLI_COMMAND=unset'), line);
+    assert.ok(line.includes('USERPROFILE=set'), line);
+    assert.ok(line.includes('APPDATA=set'), line);
+    assert.ok(line.includes('C:\\Orca\\resources\\bin\\orca.exe -> not_found'), line);
+    assert.ok(!line.includes('SECRET'), line);
+  });
+
+  test('logs spawn failures once per minute per code, truncated, without write-command content', async () => {
+    const lines: string[] = [];
+    let now = 1_000_000;
+    setOrcaCliDiagnosticLogger((l) => lines.push(l), { now: () => now });
+    try {
+      const failing = async () => ({
+        stdout: '',
+        stderr: 'spawn EINVAL ' + 'x'.repeat(1000),
+        exitCode: null,
+        spawnError: { code: 'EINVAL', errno: -4071 },
+      });
+      const cli = new OrcaCli({ runner: failing });
+      await assert.rejects(() => cli.status(), isOrcaCliError);
+      await assert.rejects(() => cli.botList(), isOrcaCliError);
+      assert.equal(lines.length, 1);
+      assert.ok(lines[0].includes('code=EINVAL'), lines[0]);
+      assert.ok(lines[0].includes('errno=-4071'), lines[0]);
+      assert.ok(lines[0].length < 450, `line too long: ${lines[0].length}`);
+
+      now += 61_000;
+      await assert.rejects(() => cli.status(), isOrcaCliError);
+      assert.equal(lines.length, 2);
+
+      // Write path (Quick Send): message text and stderr never reach the log
+      await assert.rejects(
+        () =>
+          sendQuickBotMessage('Ops Lead', 'TOP-SECRET-MESSAGE', {
+            runner: async () => ({
+              stdout: '',
+              stderr: 'echo TOP-SECRET-MESSAGE',
+              exitCode: 1,
+            }),
+          }),
+        isOrcaCliError
+      );
+      assert.equal(lines.length, 3);
+      assert.ok(lines[2].includes('code=exit_1'), lines[2]);
+      assert.ok(!lines.some((l) => l.includes('TOP-SECRET-MESSAGE')));
+    } finally {
+      setOrcaCliDiagnosticLogger(null);
     }
   });
 });

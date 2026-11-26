@@ -138,7 +138,7 @@ describe('Bot World v0.3.0 — Power User Edition features', () => {
       version: string;
       contributes: { settings: Array<{ key: string; enum?: string[]; enumLabels?: string[] }> };
     };
-    assert.equal(manifest.version, '1.0.0');
+    assert.match(manifest.version, /^1\.0\.0(-autoseller\.\d+)?$/);
     const themeSetting = manifest.contributes.settings.find((s) => s.key === 'defaultTheme');
     assert.deepEqual(themeSetting?.enum, ['startup_office', 'corporate_office', 'cozy_cafe', 'cyber_ops']);
     assert.deepEqual(themeSetting?.enumLabels, [

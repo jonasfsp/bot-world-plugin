@@ -12,10 +12,12 @@
 
 ## Fork note: cross-platform CLI discovery
 
-This is a local fork of upstream v1.0.0 (`1.0.0-autoseller.1`) with one change: `src/orca-cli.ts` now finds the Orca CLI on Windows and Linux too, not only on macOS.
+This is a local fork of upstream v1.0.0 (`1.0.0-autoseller.x`) with one change: `src/orca-cli.ts` now finds the Orca CLI on Windows and Linux too, not only on macOS.
 
 - Discovery order: `ORCA_CLI_COMMAND` (an absolute path to an existing file), then the platform defaults. Windows: `%LOCALAPPDATA%\Programs\Orca\resources\bin\orca.exe`, then `%ProgramFiles%\Orca\resources\bin\orca.exe`. Linux: `${XDG_CONFIG_HOME:-~/.config}/orca/cli/bin/orca`, then `/opt/Orca/resources/bin/orca-ide`. macOS: the same paths as upstream.
 - The POSIX owner/mode/ancestor checks are unchanged. On Windows they are replaced by: a drive-absolute path, a `.exe` file (a `.cmd` path is mapped to the sibling `orca.exe`, never run, because of CVE-2024-27980), an existing regular file, and a realpath inside `%LOCALAPPDATA%` or `%ProgramFiles%` (or equal to `ORCA_CLI_COMMAND`).
+- Orca forks plugin workers with a reduced env (no `LOCALAPPDATA`/`APPDATA`/`ProgramFiles`/`ORCA_CLI_COMMAND`), so on Windows the CLI is also derived from the running Orca (`dirname(process.execPath)\resources\bin\orca.exe`) and from the profile (`%USERPROFILE%\AppData\Local\Programs\Orca\…`), and `APPDATA`/`LOCALAPPDATA` are derived from the profile for the CLI when missing (`1.0.0-autoseller.2`).
+- When discovery or a CLI run fails, one short line per error code per minute goes to the plugin log (`orca plugin logs`): platform, env key presence (never values), `process.execPath`, each candidate with its rejection reason, and the spawn error code.
 - The command allowlist, argument validation and Quick Send opt-in are unchanged.
 
 ## Quick Start

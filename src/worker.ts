@@ -45,6 +45,7 @@ import {
   type OrcaClient,
   replyNeedsOwnerItem,
   sendQuickBotMessage,
+  setOrcaCliDiagnosticLogger,
   validateQuickMessageBody,
 } from './orca-cli.ts';
 import { PollerSession } from './poller.ts';
@@ -2007,6 +2008,8 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
     activeController.dispose();
     activeController = null;
   }
+  // Discovery/spawn diagnostics (presence-only env info, rate-limited) go to the plugin log.
+  setOrcaCliDiagnosticLogger((line) => orca.log(line));
   const controller = new BotWorldWorkerController(orca);
   activeController = controller;
   await controller.init();
@@ -2014,6 +2017,7 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
 }
 
 export async function deactivate(): Promise<void> {
+  setOrcaCliDiagnosticLogger(null);
   if (activeController) {
     activeController.dispose();
     activeController = null;
