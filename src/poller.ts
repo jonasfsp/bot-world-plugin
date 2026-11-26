@@ -12,7 +12,7 @@ import {
   pruneSnapshotState,
   rebaselineSnapshot,
 } from './normalize.ts';
-import { type OrcaClient, OrcaCliError } from './orca-cli.ts';
+import { MAX_CONCURRENT_CLI, type OrcaClient, OrcaCliError } from './orca-cli.ts';
 import { scrubAll } from './redact.ts';
 import { type WorldSnapshot, createEmptySnapshot } from './types.ts';
 
@@ -21,7 +21,19 @@ export const INACTIVE_FAST_INTERVAL_MS = 12_000;
 const DEFAULT_MEDIUM_INTERVAL_MS = 5_000;
 const SLOW_INTERVAL_MS = 25_000;
 const MAX_BACKOFF_SECS = 30;
-const MAX_CONCURRENT_CLI = 4;
+
+/**
+ * Errors that mean the runtime itself is gone (or the poller was stopped). Only
+ * these (plus a failed/unreachable `status`) may take the board Offline; any other
+ * failure of a single fast/medium command (timeout, non_zero_exit, invalid_argument,
+ * json_error, output_too_large) is tolerated and keeps that command's previous data.
+ */
+export function isRuntimeFatal(err: unknown): boolean {
+  return (
+    err instanceof OrcaCliError &&
+    (err.code === 'stopped' || err.code === 'runtime_unavailable' || err.code === 'binary_not_found')
+  );
+}
 
 export function computeSnapshotFingerprint(snapshot: WorldSnapshot): string {
   return JSON.stringify({
@@ -365,44 +377,63 @@ async function pollSlowTier(
 
 async function pollFastTier(cli: OrcaClient, snapshot: WorldSnapshot): Promise<void> {
   if (cli.isStopped()) throw new OrcaCliError('stopped', 'Poller stopped');
-  const [inbox, firstWorkers, worktrees] = await Promise.all([
+  const [inboxRes, workersRes, worktreesRes] = await Promise.allSettled([
     cli.orchestrationInbox(30),
     cli.orchestrationWorkerList(100, null),
     cli.worktreePs('24h'),
   ]);
 
-  applyInbox(snapshot, inbox);
-  if (snapshot.inboxCursor.needsBackfill) {
-    if (cli.isStopped()) throw new OrcaCliError('stopped', 'Poller stopped');
-    try {
-      const fullInbox = await cli.orchestrationInbox(100);
-      applyInboxBackfill(snapshot, fullInbox);
-    } catch (err) {
-      if (err instanceof OrcaCliError && err.code === 'stopped') throw err;
+  // Runtime-level failures (and stop) still propagate; the rest are tolerated
+  // per command (the CLI layer already logged them) and keep the previous data.
+  for (const res of [inboxRes, workersRes, worktreesRes]) {
+    if (res.status === 'rejected' && isRuntimeFatal(res.reason)) {
+      throw res.reason;
     }
   }
 
-  applyWorkerList(snapshot, firstWorkers);
-  let cursor = extractNextWorkerCursor(firstWorkers);
-  for (let page = 1; page < 5 && cursor !== null; page++) {
-    if (cli.isStopped()) throw new OrcaCliError('stopped', 'Poller stopped');
-    let workers: Awaited<ReturnType<OrcaClient['orchestrationWorkerList']>>;
-    try {
-      workers = await cli.orchestrationWorkerList(100, cursor);
-    } catch (err) {
-      if (err instanceof OrcaCliError && err.code === 'invalid_argument') {
+  if (inboxRes.status === 'fulfilled') {
+    applyInbox(snapshot, inboxRes.value);
+    if (snapshot.inboxCursor.needsBackfill) {
+      if (cli.isStopped()) throw new OrcaCliError('stopped', 'Poller stopped');
+      try {
+        const fullInbox = await cli.orchestrationInbox(100);
+        applyInboxBackfill(snapshot, fullInbox);
+      } catch (err) {
+        if (isRuntimeFatal(err)) throw err;
+      }
+    }
+  }
+
+  if (workersRes.status === 'fulfilled') {
+    const firstWorkers = workersRes.value;
+    applyWorkerList(snapshot, firstWorkers);
+    let cursor = extractNextWorkerCursor(firstWorkers);
+    for (let page = 1; page < 5 && cursor !== null; page++) {
+      if (cli.isStopped()) throw new OrcaCliError('stopped', 'Poller stopped');
+      let workers: Awaited<ReturnType<OrcaClient['orchestrationWorkerList']>>;
+      try {
+        workers = await cli.orchestrationWorkerList(100, cursor);
+      } catch (err) {
+        if (isRuntimeFatal(err)) throw err;
         break;
       }
-      throw err;
+      applyWorkerList(snapshot, workers);
+      cursor = extractNextWorkerCursor(workers);
     }
-    applyWorkerList(snapshot, workers);
-    cursor = extractNextWorkerCursor(workers);
   }
 
-  applyWorktreePs(snapshot, worktrees);
-  snapshot.runtime.connected = true;
-  snapshot.runtime.reachable = true;
-  snapshot.runtime.retryAfterSecs = null;
+  if (worktreesRes.status === 'fulfilled') {
+    applyWorktreePs(snapshot, worktreesRes.value);
+  }
+
+  // Liveness comes from `status` (slow tier); a fast tier where every command
+  // failed for non-runtime reasons leaves the runtime fields as they were.
+  const anyOk = [inboxRes, workersRes, worktreesRes].some((r) => r.status === 'fulfilled');
+  if (anyOk) {
+    snapshot.runtime.connected = true;
+    snapshot.runtime.reachable = true;
+    snapshot.runtime.retryAfterSecs = null;
+  }
 }
 
 function extractNextWorkerCursor(workers: Awaited<ReturnType<OrcaClient['orchestrationWorkerList']>>): string | null {
@@ -512,26 +543,18 @@ async function pollMediumTier(
         applyBotItemsScoped(snapshot, items, false);
       }
     } else {
-      const err = itemsRes.reason;
-      if (
-        allOnBoot ||
-        (err instanceof OrcaCliError &&
-          (err.code === 'stopped' || err.code === 'runtime_unavailable'))
-      ) {
-        throw err;
+      // e.g. "No bot named X" (bot lives on a remote runtime) or a timeout:
+      // keep this bot's previous items instead of failing the whole tier.
+      if (isRuntimeFatal(itemsRes.reason)) {
+        throw itemsRes.reason;
       }
     }
 
     if (chatsRes.status === 'fulfilled') {
       applyBotChats(snapshot, chatsRes.value);
     } else {
-      const err = chatsRes.reason;
-      if (
-        allOnBoot ||
-        (err instanceof OrcaCliError &&
-          (err.code === 'stopped' || err.code === 'runtime_unavailable'))
-      ) {
-        throw err;
+      if (isRuntimeFatal(chatsRes.reason)) {
+        throw chatsRes.reason;
       }
     }
   }

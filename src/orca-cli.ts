@@ -48,10 +48,31 @@ const WINDOWS_SAFE_PATH_ENV_KEYS: readonly string[] = [
   'TMP',
 ] as const;
 
-export const MAX_CLI_TIMEOUT_MS = 8_000;
-export const DEFAULT_CLI_TIMEOUT_MS = 4_000;
+/**
+ * Per-platform CLI limits. On Windows every call starts Orca.exe (a full Electron
+ * binary run with ELECTRON_RUN_AS_NODE=1), which often takes several seconds cold,
+ * longer under antivirus scanning or when several start at once. Measured on the
+ * owner's machine (sequential): cold inbox 2.0 s, worker-list 11.4 s, worktree ps
+ * 4.9 s; warm 1.2-1.8 s. The old 4 s timeout made the poller report "Offline".
+ * 20 s default (30 s cap) covers a cold worker-list with margin; concurrency 2
+ * keeps cold starts from competing. POSIX keeps the upstream limits (the
+ * Linux/macOS launchers start a plain Node in well under a second).
+ */
+export function cliLimitsFor(platform: NodeJS.Platform): {
+  defaultTimeoutMs: number;
+  maxTimeoutMs: number;
+  maxConcurrent: number;
+} {
+  return platform === 'win32'
+    ? { defaultTimeoutMs: 20_000, maxTimeoutMs: 30_000, maxConcurrent: 2 }
+    : { defaultTimeoutMs: 4_000, maxTimeoutMs: 8_000, maxConcurrent: 4 };
+}
+
+const PLATFORM_CLI_LIMITS = cliLimitsFor(process.platform);
+export const MAX_CLI_TIMEOUT_MS = PLATFORM_CLI_LIMITS.maxTimeoutMs;
+export const DEFAULT_CLI_TIMEOUT_MS = PLATFORM_CLI_LIMITS.defaultTimeoutMs;
 export const MAX_CLI_OUTPUT_BYTES = 2 * 1024 * 1024;
-const MAX_CONCURRENT_CLI = 4;
+export const MAX_CONCURRENT_CLI = PLATFORM_CLI_LIMITS.maxConcurrent;
 
 export type CliEnvelope<T> = {
   id?: string;
@@ -732,17 +753,68 @@ function discoverAndLog(): string | null {
   return report.path;
 }
 
-function logRunFailure(res: CliRunnerResult, includeStderr: boolean): void {
-  const spawn = res.spawnError;
-  const code = spawn?.code ?? `exit_${String(res.exitCode)}`;
-  const parts = [`run_failed code=${code}`];
-  if (spawn?.errno !== undefined) {
-    parts.push(`errno=${spawn.errno}`);
+/** What a failed run left behind, for the failure log line. */
+type FailureProbe = {
+  res?: CliRunnerResult;
+  envelope?: { code: string; message: string };
+};
+
+/** "bot chats", "orchestration worker-list", "status": args[0..1] without flags; never bot names. */
+export function cliCommandLabel(args: readonly string[]): string {
+  return args
+    .slice(0, 2)
+    .filter((a) => typeof a === 'string' && !a.startsWith('-'))
+    .map((a) => a.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 32))
+    .join(' ');
+}
+
+function logCliFailure(
+  err: OrcaCliError,
+  args: readonly string[],
+  isWrite: boolean,
+  probe: FailureProbe,
+  durationMs: number
+): void {
+  const label = cliCommandLabel(args);
+  const parts = [`fail code=${err.code} cmd="${label}" ms=${Math.max(0, Math.round(durationMs))}`];
+  const res = probe.res;
+  if (res?.spawnError?.code) {
+    parts.push(`spawn=${truncateForLog(res.spawnError.code).slice(0, 32)}`);
   }
-  if (includeStderr && res.stderr) {
+  if (res?.spawnError?.errno !== undefined) {
+    parts.push(`errno=${res.spawnError.errno}`);
+  }
+  if (res && res.exitCode !== 0 && res.exitCode !== null) {
+    parts.push(`exit=${res.exitCode}`);
+  }
+  if (probe.envelope) {
+    parts.push(`envelope=${truncateForLog(probe.envelope.code).slice(0, 64)}`);
+    if (!isWrite) {
+      parts.push(`message="${truncateForLog(probe.envelope.message)}"`);
+    }
+  } else if (!isWrite && res && res.exitCode !== 0 && res.stderr) {
+    // Read-only commands only: write commands carry the user's message in argv.
     parts.push(`stderr="${truncateForLog(res.stderr)}"`);
   }
-  emitDiagnostic(`run:${code}`, parts.join(' '));
+  emitDiagnostic(`fail:${err.code}:${label}`, parts.join(' '));
+}
+
+/** Time a CLI run and log every OrcaCliError it ends with (except stop / already-logged discovery). */
+async function withFailureLog<T>(
+  args: readonly string[],
+  isWrite: boolean,
+  fn: (probe: FailureProbe) => Promise<T>
+): Promise<T> {
+  const probe: FailureProbe = {};
+  const started = Date.now();
+  try {
+    return await fn(probe);
+  } catch (err) {
+    if (err instanceof OrcaCliError && err.code !== 'stopped' && err.code !== 'binary_not_found') {
+      logCliFailure(err, args, isWrite, probe, Date.now() - started);
+    }
+    throw err;
+  }
 }
 
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
@@ -959,7 +1031,7 @@ const defaultExecFileRunner: CliRunner = (binaryPath, args, options) => {
             reject(new OrcaCliError('stopped', 'CLI command aborted'));
             return;
           }
-          if (errObj.killed && errObj.signal === 'SIGTERM') {
+          if (errObj.killed === true) {
             reject(new OrcaCliError('timeout', `CLI command timed out after ${options.timeoutMs}ms`));
             return;
           }
@@ -1088,6 +1160,10 @@ export class OrcaCli implements OrcaClient {
 
   async runEnvelope<T = unknown>(args: readonly string[]): Promise<CliEnvelope<T>> {
     assertAllowedSubcommand(args);
+    return withFailureLog(args, false, (probe) => this.runEnvelopeInner<T>(args, probe));
+  }
+
+  private async runEnvelopeInner<T>(args: readonly string[], probe: FailureProbe): Promise<CliEnvelope<T>> {
     if (this.stopped) {
       throw new OrcaCliError('stopped', 'Orca CLI stopped');
     }
@@ -1104,14 +1180,13 @@ export class OrcaCli implements OrcaClient {
         env: this.env,
         signal: this.abortController.signal,
       });
+      probe.res = res;
 
       if (Buffer.byteLength(res.stdout, 'utf8') > MAX_CLI_OUTPUT_BYTES) {
         throw new OrcaCliError('output_too_large', 'CLI stdout exceeded 2 MiB');
       }
 
       if (res.exitCode !== 0 && res.stdout.trim().length === 0) {
-        // Read-only commands: stderr carries no bot message content.
-        logRunFailure(res, true);
         const stderr = res.stderr.trim();
         if (stderr.includes('not reachable') || stderr.includes('runtime_unavailable')) {
           throw new OrcaCliError('runtime_unavailable', stderr || 'Orca runtime unavailable');
@@ -1139,10 +1214,7 @@ export class OrcaCli implements OrcaClient {
       if (!parsed.ok && parsed.error) {
         const code = String(parsed.error.code ?? '');
         const msg = String(parsed.error.message ?? '');
-        emitDiagnostic(
-          `envelope:${code.slice(0, 64)}`,
-          `envelope_error code=${truncateForLog(code).slice(0, 64)} message="${truncateForLog(msg)}"`
-        );
+        probe.envelope = { code, message: msg };
         if (code === 'runtime_unavailable' || msg.includes('not reachable')) {
           throw new OrcaCliError('runtime_unavailable', msg || 'Orca runtime unavailable');
         }
@@ -1309,6 +1381,14 @@ async function runWriteEnvelope(
   args: readonly string[],
   options?: CliWriteOptions
 ): Promise<CliEnvelope<unknown>> {
+  return withFailureLog(args, true, (probe) => runWriteEnvelopeInner(args, probe, options));
+}
+
+async function runWriteEnvelopeInner(
+  args: readonly string[],
+  probe: FailureProbe,
+  options?: CliWriteOptions
+): Promise<CliEnvelope<unknown>> {
   const hasCustomRunner = Boolean(options?.runner);
   const execPath = hasCustomRunner
     ? options?.binaryPath === undefined
@@ -1330,14 +1410,13 @@ async function runWriteEnvelope(
     env,
     signal: options?.signal,
   });
+  probe.res = res;
 
   if (Buffer.byteLength(res.stdout, 'utf8') > MAX_CLI_OUTPUT_BYTES) {
     throw new OrcaCliError('output_too_large', 'CLI stdout exceeded 2 MiB');
   }
 
   if (res.exitCode !== 0 && res.stdout.trim().length === 0) {
-    // Write commands carry the user's message in argv; never log their stderr.
-    logRunFailure(res, false);
     const stderr = res.stderr.trim();
     if (stderr.includes('not reachable') || stderr.includes('runtime_unavailable')) {
       throw new OrcaCliError('runtime_unavailable', stderr || 'Orca runtime unavailable');
@@ -1365,6 +1444,7 @@ async function runWriteEnvelope(
   if (!parsed.ok && parsed.error) {
     const code = String(parsed.error.code ?? '');
     const msg = String(parsed.error.message ?? '');
+    probe.envelope = { code, message: msg };
     if (code === 'runtime_unavailable' || msg.includes('not reachable')) {
       throw new OrcaCliError('runtime_unavailable', msg || 'Orca runtime unavailable');
     }

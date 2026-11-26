@@ -17,7 +17,7 @@ import {
   syncToolbarChrome,
   watchDocumentVisibility,
 } from '../shared/toolbar-chrome.ts';
-import type { OrcaClient } from './orca-cli.ts';
+import { type OrcaClient, OrcaCliError } from './orca-cli.ts';
 import {
   FAST_INTERVAL_MS,
   INACTIVE_FAST_INTERVAL_MS,
@@ -637,7 +637,8 @@ describe('Bot World Stage-1 Optimization & 0px Layout-Shift Toolbar', () => {
       }),
       orchestrationInbox: async () => {
         inboxCallCount++;
-        if (failInbox) throw new Error('runtime offline');
+        // Runtime-level failure (an isolated non-runtime error is tolerated since autoseller.3)
+        if (failInbox) throw new OrcaCliError('runtime_unavailable', 'runtime offline');
         return { ok: true, result: { messages: [] } };
       },
     });

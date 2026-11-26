@@ -11,6 +11,8 @@ import {
   discoverOrcaBinary,
   discoverOrcaBinaryWithReport,
   formatDiscoveryReport,
+  cliCommandLabel,
+  cliLimitsFor,
   sendQuickBotMessage,
   setOrcaCliDiagnosticLogger,
   getDefaultOrcaCandidates,
@@ -22,7 +24,7 @@ import {
   verifyWindowsBinaryPath,
   type WindowsFsProbe,
 } from './orca-cli.ts';
-import { PollerSession } from './poller.ts';
+import { PollerSession, isRuntimeFatal } from './poller.ts';
 
 const isOrcaCliError = (err: unknown): boolean => err instanceof OrcaCliError;
 
@@ -671,9 +673,10 @@ describe('OrcaCli Windows reduced worker env & diagnostics', () => {
       });
       const cli = new OrcaCli({ runner: failing });
       await assert.rejects(() => cli.status(), isOrcaCliError);
-      await assert.rejects(() => cli.botList(), isOrcaCliError);
+      await assert.rejects(() => cli.status(), isOrcaCliError);
       assert.equal(lines.length, 1);
-      assert.ok(lines[0].includes('code=EINVAL'), lines[0]);
+      assert.ok(lines[0].includes('fail code=non_zero_exit cmd="status"'), lines[0]);
+      assert.ok(lines[0].includes('spawn=EINVAL'), lines[0]);
       assert.ok(lines[0].includes('errno=-4071'), lines[0]);
       assert.ok(lines[0].length < 450, `line too long: ${lines[0].length}`);
 
@@ -694,10 +697,182 @@ describe('OrcaCli Windows reduced worker env & diagnostics', () => {
         isOrcaCliError
       );
       assert.equal(lines.length, 3);
-      assert.ok(lines[2].includes('code=exit_1'), lines[2]);
+      assert.ok(lines[2].includes('cmd="orchestration send"'), lines[2]);
+      assert.ok(lines[2].includes('exit=1'), lines[2]);
       assert.ok(!lines.some((l) => l.includes('TOP-SECRET-MESSAGE')));
     } finally {
       setOrcaCliDiagnosticLogger(null);
     }
+  });
+});
+
+describe('OrcaCli failure logging, Windows limits & tolerant poller (autoseller.3)', () => {
+  test('Windows gets longer timeouts and lower concurrency; POSIX keeps upstream limits', () => {
+    assert.deepEqual(cliLimitsFor('win32'), { defaultTimeoutMs: 20_000, maxTimeoutMs: 30_000, maxConcurrent: 2 });
+    assert.deepEqual(cliLimitsFor('linux'), { defaultTimeoutMs: 4_000, maxTimeoutMs: 8_000, maxConcurrent: 4 });
+    assert.deepEqual(cliLimitsFor('darwin'), cliLimitsFor('linux'));
+    // Windows cold worker-list measured at 11.4 s must fit the default timeout
+    assert.ok(cliLimitsFor('win32').defaultTimeoutMs > 11_400);
+  });
+
+  test('command label is args[0..1] without flags or bot names', () => {
+    assert.equal(cliCommandLabel(['status', '--json']), 'status');
+    assert.equal(cliCommandLabel(['orchestration', 'worker-list', '--limit', '100']), 'orchestration worker-list');
+    assert.equal(cliCommandLabel(['bot', 'chats', '--bot', 'Secret Bot', '--json']), 'bot chats');
+  });
+
+  test('logs timeout, json_error, output_too_large and envelope failures with command and duration', async () => {
+    const lines: string[] = [];
+    setOrcaCliDiagnosticLogger((l) => lines.push(l), { now: () => 5_000_000 });
+    try {
+      const timeoutCli = new OrcaCli({
+        runner: async () => {
+          throw new OrcaCliError('timeout', 'CLI command timed out after 4000ms');
+        },
+      });
+      await assert.rejects(() => timeoutCli.orchestrationWorkerList(100, null), isOrcaCliError);
+      assert.match(lines.at(-1) ?? '', /fail code=timeout cmd="orchestration worker-list" ms=\d+/);
+
+      const jsonCli = new OrcaCli({ runner: async () => ({ stdout: '{not json', stderr: '', exitCode: 0 }) });
+      await assert.rejects(() => jsonCli.worktreePs('24h'), isOrcaCliError);
+      assert.match(lines.at(-1) ?? '', /fail code=json_error cmd="worktree ps"/);
+
+      const bigCli = new OrcaCli({
+        runner: async () => ({ stdout: 'x'.repeat(2 * 1024 * 1024 + 10), stderr: '', exitCode: 0 }),
+      });
+      await assert.rejects(() => bigCli.orchestrationInbox(30), isOrcaCliError);
+      assert.match(lines.at(-1) ?? '', /fail code=output_too_large cmd="orchestration inbox"/);
+
+      const envCli = new OrcaCli({
+        runner: async () => ({
+          stdout: JSON.stringify({ ok: false, error: { code: 'invalid_argument', message: 'No bot named Scout' } }),
+          stderr: '',
+          exitCode: 1,
+        }),
+      });
+      await assert.rejects(() => envCli.botChats('Scout'), isOrcaCliError);
+      const envLine = lines.at(-1) ?? '';
+      assert.ok(envLine.includes('fail code=non_zero_exit cmd="bot chats"'), envLine);
+      assert.ok(envLine.includes('envelope=invalid_argument'), envLine);
+
+      // Same code+command within 60 s is rate-limited; a different command is not
+      const before = lines.length;
+      await assert.rejects(() => timeoutCli.orchestrationWorkerList(100, null), isOrcaCliError);
+      assert.equal(lines.length, before);
+      await assert.rejects(() => timeoutCli.status(), isOrcaCliError);
+      assert.equal(lines.length, before + 1);
+
+      // Stop is not a failure
+      const stopped = new OrcaCli({ runner: async () => ({ stdout: '{}', stderr: '', exitCode: 0 }) });
+      stopped.stop();
+      await assert.rejects(() => stopped.status(), isOrcaCliError);
+      assert.equal(lines.length, before + 1);
+    } finally {
+      setOrcaCliDiagnosticLogger(null);
+    }
+  });
+
+  type Over = Partial<Record<string, (...a: unknown[]) => Promise<unknown>>>;
+  function mockClient(over: Over = {}) {
+    const ok = (result: unknown) => async () => ({ ok: true, result });
+    const base: Record<string, (...a: unknown[]) => Promise<unknown>> = {
+      status: ok({ runtime: { state: 'ready', reachable: true, runtimeId: 'rt-1' } }),
+      botList: ok({
+        bots: [
+          { id: 'b1', name: 'Ops Lead', agent: 'claude', paused: false },
+          { id: 'b2', name: 'Scout', agent: 'claude', paused: false },
+        ],
+      }),
+      botChats: async (name: unknown) => ({ ok: true, result: { bot: name, chats: [] } }),
+      botItemList: async (name: unknown) => ({ ok: true, result: { botId: 'b1', botName: name, items: [] } }),
+      worktreePs: ok({ worktrees: [] }),
+      orchestrationInbox: ok({ messages: [] }),
+      orchestrationWorkerList: ok({ workers: [], page: { hasMore: false } }),
+      orchestrationRunList: ok({ runs: [] }),
+      automationsList: ok({ automations: [] }),
+      automationsRuns: ok({ runs: [] }),
+    };
+    return { isStopped: () => false, ...base, ...over } as unknown as Parameters<PollerSession['step']>[0];
+  }
+  const fail = (code: ConstructorParameters<typeof OrcaCliError>[0], msg = code) => async () => {
+    throw new OrcaCliError(code, msg);
+  };
+
+  test('isolated fast-tier failures (timeout, non_zero_exit, json_error) keep the board connected', async () => {
+    for (const code of ['timeout', 'non_zero_exit', 'json_error', 'invalid_argument', 'output_too_large'] as const) {
+      const session = new PollerSession();
+      const res = await session.step(mockClient({ orchestrationWorkerList: fail(code) }), { forceFull: true });
+      assert.equal(session.snapshot.runtime.connected, true, `${code} must not go Offline`);
+      assert.equal(session.snapshot.runtime.retryAfterSecs, null, code);
+      assert.ok(res.sleepMs <= 2_000, `${code}: no offline backoff (slept ${res.sleepMs})`);
+    }
+    // Even when every fast command times out, a healthy `status` keeps it connected
+    const session = new PollerSession();
+    await session.step(
+      mockClient({
+        orchestrationInbox: fail('timeout'),
+        orchestrationWorkerList: fail('timeout'),
+        worktreePs: fail('timeout'),
+      }),
+      { forceFull: true }
+    );
+    assert.equal(session.snapshot.runtime.connected, true);
+  });
+
+  test('remote-only bots ("No bot named") do not block the initial sync', async () => {
+    const session = new PollerSession();
+    const client = mockClient({
+      botChats: async (name: unknown) => {
+        if (name === 'Scout') throw new OrcaCliError('non_zero_exit', 'invalid_argument: No bot named Scout');
+        return { ok: true, result: { bot: name, chats: [] } };
+      },
+      botItemList: async (name: unknown) => {
+        if (name === 'Scout') throw new OrcaCliError('non_zero_exit', 'invalid_argument: No bot named Scout');
+        return { ok: true, result: { botId: 'b1', botName: name, items: [] } };
+      },
+    });
+    await session.step(client, { forceFull: true });
+    assert.equal(session.snapshot.runtime.connected, true);
+    assert.equal(session.mediumSynced, true);
+    assert.equal(session.snapshot.initialSyncComplete, true);
+  });
+
+  test('status failure and runtime-level errors still go Offline', async () => {
+    const statusDown = new PollerSession();
+    await statusDown.step(mockClient({ status: fail('timeout') }), { forceFull: true });
+    assert.equal(statusDown.snapshot.runtime.connected, false);
+    assert.ok((statusDown.snapshot.runtime.retryAfterSecs ?? 0) > 0);
+
+    const unreachable = new PollerSession();
+    await unreachable.step(
+      mockClient({ status: async () => ({ ok: true, result: { runtime: { state: 'down', reachable: false } } }) }),
+      { forceFull: true }
+    );
+    assert.equal(unreachable.snapshot.runtime.connected, false);
+
+    for (const code of ['runtime_unavailable', 'binary_not_found'] as const) {
+      const session = new PollerSession();
+      await session.step(mockClient({ worktreePs: fail(code) }), { forceFull: true });
+      assert.equal(session.snapshot.runtime.connected, false, code);
+    }
+
+    assert.equal(isRuntimeFatal(new OrcaCliError('timeout', 't')), false);
+    assert.equal(isRuntimeFatal(new OrcaCliError('runtime_unavailable', 'r')), true);
+    assert.equal(isRuntimeFatal(new Error('x')), false);
+  });
+
+  test('a failed fast command keeps its previous data', async () => {
+    const session = new PollerSession();
+    const workers = {
+      workers: [{ id: 'w1', handle: 'w1', status: 'running', agent: 'claude', taskId: 't1' }],
+      page: { hasMore: false },
+    };
+    await session.step(mockClient({ orchestrationWorkerList: async () => ({ ok: true, result: workers }) }), {
+      forceFull: true,
+    });
+    const before = JSON.stringify(session.snapshot.workers);
+    await session.step(mockClient({ orchestrationWorkerList: fail('timeout') }), { forceFast: true });
+    assert.equal(JSON.stringify(session.snapshot.workers), before);
+    assert.equal(session.snapshot.runtime.connected, true);
   });
 });
