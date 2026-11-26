@@ -1,8 +1,10 @@
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { safeJsonParse } from './types.ts';
 
+// macOS install locations (unchanged from upstream v1.0.0).
 export const TRUSTED_ORCA_PATHS: readonly string[] = [
   '/Applications/Orca.app/Contents/Resources/bin/orca',
   '/opt/homebrew/bin/orca',
@@ -15,6 +17,12 @@ const TRUSTED_REALPATH_PREFIXES: readonly string[] = [
   '/usr/local/',
 ] as const;
 
+// Linux: Orca desktop writes a per-user launcher to <userData>/cli/bin/orca
+// (userData = ${XDG_CONFIG_HOME:-~/.config}/orca). The root-owned app bundle
+// launcher (/opt/Orca/resources/bin/orca-ide) is a fallback.
+const LINUX_SYSTEM_ORCA_PATHS: readonly string[] = ['/opt/Orca/resources/bin/orca-ide'] as const;
+const LINUX_SYSTEM_REALPATH_PREFIXES: readonly string[] = ['/opt/Orca/resources/bin/'] as const;
+
 const SAFE_ENV_KEYS: readonly string[] = [
   'PATH',
   'HOME',
@@ -22,6 +30,22 @@ const SAFE_ENV_KEYS: readonly string[] = [
   'LANG',
   'LC_ALL',
   'USER',
+] as const;
+
+// Read by the Orca CLI to locate the runtime metadata (userData) directory.
+// Values must be absolute paths.
+const SAFE_PATH_ENV_KEYS: readonly string[] = ['XDG_CONFIG_HOME', 'ORCA_USER_DATA_PATH'] as const;
+
+// Windows-only: SystemRoot is required by Node/Electron (Winsock, crypto);
+// APPDATA locates %APPDATA%\orca (runtime metadata); USERPROFILE backs
+// os.homedir(); TEMP/TMP back os.tmpdir(); LOCALAPPDATA is the per-user install root.
+const WINDOWS_SAFE_PATH_ENV_KEYS: readonly string[] = [
+  'SystemRoot',
+  'LOCALAPPDATA',
+  'APPDATA',
+  'USERPROFILE',
+  'TEMP',
+  'TMP',
 ] as const;
 
 export const MAX_CLI_TIMEOUT_MS = 8_000;
@@ -90,22 +114,39 @@ export class OrcaCliError extends Error {
   }
 }
 
+function isWindowsDriveAbsolute(value: string): boolean {
+  // Rejects UNC (\\server\share), device (\\?\) and drive-relative (C:foo) paths.
+  return /^[A-Za-z]:[\\/]/.test(value);
+}
+
+function isAbsoluteForPlatform(value: string, platform: NodeJS.Platform): boolean {
+  return platform === 'win32' ? isWindowsDriveAbsolute(value) : value.startsWith('/');
+}
+
 export function buildMinimalSafeEnv(
-  sourceEnv: NodeJS.ProcessEnv = process.env
+  sourceEnv: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform
 ): Record<string, string> {
   const safe: Record<string, string> = {};
-  for (const key of SAFE_ENV_KEYS) {
+  const delimiter = platform === 'win32' ? ';' : ':';
+  const pathKeys = platform === 'win32'
+    ? [...SAFE_PATH_ENV_KEYS, ...WINDOWS_SAFE_PATH_ENV_KEYS]
+    : SAFE_PATH_ENV_KEYS;
+  for (const key of [...SAFE_ENV_KEYS, ...pathKeys]) {
     const val = sourceEnv[key];
     if (typeof val !== 'string' || val.length === 0 || val.includes('\0')) {
       continue;
     }
     if (key === 'PATH') {
       const filtered = val
-        .split(path.delimiter)
-        .filter((seg) => seg.length > 0 && seg.startsWith('/'));
+        .split(delimiter)
+        .filter((seg) => seg.length > 0 && isAbsoluteForPlatform(seg, platform));
       if (filtered.length > 0) {
-        safe[key] = filtered.join(path.delimiter);
+        safe[key] = filtered.join(delimiter);
       }
+      continue;
+    }
+    if (pathKeys.includes(key) && !isAbsoluteForPlatform(val, platform)) {
       continue;
     }
     safe[key] = val;
@@ -237,9 +278,185 @@ export function verifyTrustedBinaryPath(
   }
 }
 
-export function discoverOrcaBinary(): string | null {
-  for (const candidate of TRUSTED_ORCA_PATHS) {
-    const verified = verifyTrustedBinaryPath(candidate);
+export type OrcaDiscoveryContext = {
+  platform: NodeJS.Platform;
+  env: NodeJS.ProcessEnv;
+  homeDir: string | null;
+  /** Injectable for tests that simulate Windows paths on a POSIX host. */
+  windowsFs?: WindowsFsProbe;
+};
+
+export type WindowsFsProbe = {
+  isRegularFile(p: string): boolean;
+  realpath(p: string): string;
+};
+
+const nodeWindowsFsProbe: WindowsFsProbe = {
+  isRegularFile: (p) => fs.statSync(p).isFile(),
+  realpath: (p) => fs.realpathSync.native(p),
+};
+
+function defaultDiscoveryContext(): OrcaDiscoveryContext {
+  let homeDir: string | null = null;
+  try {
+    homeDir = os.homedir();
+  } catch {
+    homeDir = null;
+  }
+  return { platform: process.platform, env: process.env, homeDir };
+}
+
+function envPath(env: NodeJS.ProcessEnv, key: string, platform: NodeJS.Platform): string | null {
+  const val = env[key];
+  if (typeof val !== 'string' || val.length === 0 || val.includes('\0')) {
+    return null;
+  }
+  return isAbsoluteForPlatform(val, platform) ? val : null;
+}
+
+function windowsInstallRoots(env: NodeJS.ProcessEnv): string[] {
+  const roots: string[] = [];
+  const local = envPath(env, 'LOCALAPPDATA', 'win32');
+  if (local) {
+    roots.push(path.win32.join(local, 'Programs', 'Orca'));
+  }
+  const programFiles = envPath(env, 'ProgramFiles', 'win32');
+  if (programFiles) {
+    roots.push(path.win32.join(programFiles, 'Orca'));
+  }
+  return roots;
+}
+
+function linuxUserCliPaths(ctx: OrcaDiscoveryContext): string[] {
+  const configDirs: string[] = [];
+  const xdg = envPath(ctx.env, 'XDG_CONFIG_HOME', 'linux');
+  if (xdg) {
+    configDirs.push(xdg);
+  }
+  if (ctx.homeDir && ctx.homeDir.startsWith('/')) {
+    configDirs.push(path.posix.join(ctx.homeDir, '.config'));
+  }
+  const unique = [...new Set(configDirs.map((d) => path.posix.join(d, 'orca', 'cli', 'bin', 'orca')))];
+  return unique;
+}
+
+/** Platform default CLI locations, in discovery order (ORCA_CLI_COMMAND is checked first, separately). */
+export function getDefaultOrcaCandidates(ctx: OrcaDiscoveryContext = defaultDiscoveryContext()): string[] {
+  if (ctx.platform === 'win32') {
+    // orca.exe is preferred: Node refuses to spawn .cmd without a shell (CVE-2024-27980).
+    return windowsInstallRoots(ctx.env).map((root) =>
+      path.win32.join(root, 'resources', 'bin', 'orca.exe')
+    );
+  }
+  if (ctx.platform === 'linux') {
+    return [...linuxUserCliPaths(ctx), ...LINUX_SYSTEM_ORCA_PATHS];
+  }
+  if (ctx.platform === 'darwin') {
+    return [...TRUSTED_ORCA_PATHS];
+  }
+  return [];
+}
+
+function posixTrustedPrefixes(ctx: OrcaDiscoveryContext): string[] {
+  if (ctx.platform === 'linux') {
+    return [
+      ...linuxUserCliPaths(ctx).map((p) => path.posix.dirname(p) + '/'),
+      ...LINUX_SYSTEM_REALPATH_PREFIXES,
+    ];
+  }
+  return [...TRUSTED_REALPATH_PREFIXES];
+}
+
+function isWithinWindowsDir(child: string, dir: string): boolean {
+  const normChild = path.win32.normalize(child).toLowerCase();
+  let normDir = path.win32.normalize(dir).toLowerCase();
+  if (!normDir.endsWith('\\')) {
+    normDir += '\\';
+  }
+  return normChild.startsWith(normDir);
+}
+
+/**
+ * Windows replacement for the POSIX mode/owner checks (Node reports 0o666/0o444
+ * and has no getuid there). Requires: drive-absolute path, .exe (a .cmd is mapped
+ * to its sibling .exe, never executed), an existing regular file, and a realpath
+ * inside %LOCALAPPDATA% or %ProgramFiles%, or equal to ORCA_CLI_COMMAND's realpath.
+ */
+export function verifyWindowsBinaryPath(
+  candidate: string,
+  ctx: Pick<OrcaDiscoveryContext, 'env' | 'windowsFs'>,
+  options: { explicitlyConfigured?: boolean } = {}
+): string | null {
+  if (typeof candidate !== 'string' || candidate.includes('\0') || !isWindowsDriveAbsolute(candidate)) {
+    return null;
+  }
+  const probe = ctx.windowsFs ?? nodeWindowsFsProbe;
+  let target = path.win32.normalize(candidate);
+  const ext = path.win32.extname(target).toLowerCase();
+  if (ext === '.cmd') {
+    target = target.slice(0, -ext.length) + '.exe';
+  } else if (ext !== '.exe') {
+    return null;
+  }
+  try {
+    if (!probe.isRegularFile(target)) {
+      return null;
+    }
+    const resolved = probe.realpath(target);
+    if (!isWindowsDriveAbsolute(resolved) || path.win32.extname(resolved).toLowerCase() !== '.exe') {
+      return null;
+    }
+    if (options.explicitlyConfigured) {
+      return resolved;
+    }
+    const roots = ['LOCALAPPDATA', 'ProgramFiles']
+      .map((key) => envPath(ctx.env, key, 'win32'))
+      .filter((v): v is string => v !== null)
+      .map((dir) => {
+        try {
+          return probe.realpath(dir);
+        } catch {
+          return dir;
+        }
+      });
+    return roots.some((root) => isWithinWindowsDir(resolved, root)) ? resolved : null;
+  } catch {
+    return null;
+  }
+}
+
+function verifyCandidate(
+  candidate: string,
+  ctx: OrcaDiscoveryContext,
+  explicitlyConfigured: boolean
+): string | null {
+  if (ctx.platform === 'win32') {
+    return verifyWindowsBinaryPath(candidate, ctx, { explicitlyConfigured });
+  }
+  if (!candidate.startsWith('/')) {
+    return null;
+  }
+  const prefixes = posixTrustedPrefixes(ctx);
+  if (explicitlyConfigured) {
+    prefixes.push(path.posix.dirname(candidate) + '/');
+  }
+  return verifyTrustedBinaryPath(candidate, [candidate], prefixes);
+}
+
+/**
+ * Discovery order: (a) ORCA_CLI_COMMAND when it is an absolute path to an existing
+ * file that passes the platform checks; (b) the platform default install locations.
+ */
+export function discoverOrcaBinary(ctx: OrcaDiscoveryContext = defaultDiscoveryContext()): string | null {
+  const configured = envPath(ctx.env, 'ORCA_CLI_COMMAND', ctx.platform);
+  if (configured) {
+    const verified = verifyCandidate(configured, ctx, true);
+    if (verified) {
+      return verified;
+    }
+  }
+  for (const candidate of getDefaultOrcaCandidates(ctx)) {
+    const verified = verifyCandidate(candidate, ctx, false);
     if (verified) {
       return verified;
     }

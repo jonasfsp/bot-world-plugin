@@ -8,11 +8,15 @@ import {
   OrcaCliError,
   assertAllowedSubcommand,
   buildMinimalSafeEnv,
+  discoverOrcaBinary,
+  getDefaultOrcaCandidates,
   clampLimit,
   validateBotName,
   validateCursor,
   validateSince,
   verifyTrustedBinaryPath,
+  verifyWindowsBinaryPath,
+  type WindowsFsProbe,
 } from './orca-cli.ts';
 import { PollerSession } from './poller.ts';
 
@@ -271,5 +275,239 @@ describe('OrcaCli security & argument validation', () => {
     };
     await session.step(malformedClient, { forceFull: true });
     assert.equal(session.snapshot.runtime.connected, true);
+  });
+});
+
+// Simulated Windows filesystem: keys are lowercase paths, values are realpaths.
+function fakeWindowsFs(files: Record<string, string>, dirs: Record<string, string> = {}): WindowsFsProbe {
+  const fileMap = new Map(Object.entries(files).map(([k, v]) => [k.toLowerCase(), v]));
+  const dirMap = new Map(Object.entries(dirs).map(([k, v]) => [k.toLowerCase(), v]));
+  return {
+    isRegularFile: (p) => {
+      if (!fileMap.has(p.toLowerCase())) {
+        throw new Error('ENOENT');
+      }
+      return true;
+    },
+    realpath: (p) => {
+      const key = p.toLowerCase();
+      const hit = fileMap.get(key) ?? dirMap.get(key);
+      if (hit === undefined) {
+        throw new Error('ENOENT');
+      }
+      return hit;
+    },
+  };
+}
+
+function makeTrustedTmp(prefix: string): string {
+  const dir = fs.mkdtempSync(path.join(process.cwd(), prefix));
+  fs.chmodSync(dir, 0o755);
+  return dir;
+}
+
+function writeExec(file: string, mode: number): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o755 });
+  fs.writeFileSync(file, '#!/bin/sh\necho ok\n');
+  fs.chmodSync(file, mode);
+}
+
+describe('OrcaCli cross-platform CLI discovery', () => {
+  const WIN_ENV = {
+    LOCALAPPDATA: 'C:\\Users\\tester\\AppData\\Local',
+    ProgramFiles: 'C:\\Program Files',
+  };
+  const WIN_LOCAL_EXE = 'C:\\Users\\tester\\AppData\\Local\\Programs\\Orca\\resources\\bin\\orca.exe';
+  const WIN_PF_EXE = 'C:\\Program Files\\Orca\\resources\\bin\\orca.exe';
+  const WIN_DIRS = {
+    [WIN_ENV.LOCALAPPDATA]: WIN_ENV.LOCALAPPDATA,
+    [WIN_ENV.ProgramFiles]: WIN_ENV.ProgramFiles,
+  };
+
+  test('lists platform default candidates in order', () => {
+    assert.deepEqual(getDefaultOrcaCandidates({ platform: 'win32', env: WIN_ENV, homeDir: null }), [
+      WIN_LOCAL_EXE,
+      WIN_PF_EXE,
+    ]);
+    assert.deepEqual(
+      getDefaultOrcaCandidates({ platform: 'win32', env: { LOCALAPPDATA: 'relative\\dir' }, homeDir: null }),
+      []
+    );
+    assert.deepEqual(getDefaultOrcaCandidates({ platform: 'linux', env: {}, homeDir: '/home/jonas' }), [
+      '/home/jonas/.config/orca/cli/bin/orca',
+      '/opt/Orca/resources/bin/orca-ide',
+    ]);
+    assert.deepEqual(
+      getDefaultOrcaCandidates({ platform: 'linux', env: { XDG_CONFIG_HOME: '/xdg' }, homeDir: '/home/jonas' }),
+      ['/xdg/orca/cli/bin/orca', '/home/jonas/.config/orca/cli/bin/orca', '/opt/Orca/resources/bin/orca-ide']
+    );
+    assert.deepEqual(getDefaultOrcaCandidates({ platform: 'darwin', env: {}, homeDir: '/Users/x' }), [
+      '/Applications/Orca.app/Contents/Resources/bin/orca',
+      '/opt/homebrew/bin/orca',
+      '/usr/local/bin/orca',
+    ]);
+  });
+
+  test('Windows: finds orca.exe under %LOCALAPPDATA% or %ProgramFiles% (simulated)', () => {
+    const local = fakeWindowsFs({ [WIN_LOCAL_EXE]: WIN_LOCAL_EXE }, WIN_DIRS);
+    assert.equal(discoverOrcaBinary({ platform: 'win32', env: WIN_ENV, homeDir: null, windowsFs: local }), WIN_LOCAL_EXE);
+
+    const pf = fakeWindowsFs({ [WIN_PF_EXE]: WIN_PF_EXE }, WIN_DIRS);
+    assert.equal(discoverOrcaBinary({ platform: 'win32', env: WIN_ENV, homeDir: null, windowsFs: pf }), WIN_PF_EXE);
+
+    // Nothing installed -> null
+    assert.equal(
+      discoverOrcaBinary({ platform: 'win32', env: WIN_ENV, homeDir: null, windowsFs: fakeWindowsFs({}, WIN_DIRS) }),
+      null
+    );
+  });
+
+  test('Windows: rejects paths outside trusted roots, non-.exe, UNC, relative, and escaping links', () => {
+    const ctx = (files: Record<string, string>) => ({ env: WIN_ENV, windowsFs: fakeWindowsFs(files, WIN_DIRS) });
+    const outside = 'C:\\Temp\\orca.exe';
+    assert.equal(verifyWindowsBinaryPath(outside, ctx({ [outside]: outside })), null);
+    assert.equal(verifyWindowsBinaryPath('C:\\Users\\tester\\AppData\\Local\\orca.bat', ctx({})), null);
+    assert.equal(verifyWindowsBinaryPath('\\\\evil\\share\\orca.exe', ctx({})), null);
+    assert.equal(verifyWindowsBinaryPath('orca.exe', ctx({})), null);
+    assert.equal(verifyWindowsBinaryPath('C:orca.exe', ctx({})), null);
+    // Junction/symlink inside LOCALAPPDATA resolving outside it is refused
+    assert.equal(verifyWindowsBinaryPath(WIN_LOCAL_EXE, ctx({ [WIN_LOCAL_EXE]: outside })), null);
+    // Prefix trick: C:\Program FilesEvil is not inside C:\Program Files
+    const evil = 'C:\\Program FilesEvil\\Orca\\resources\\bin\\orca.exe';
+    assert.equal(verifyWindowsBinaryPath(evil, ctx({ [evil]: evil })), null);
+    // Case-insensitive containment
+    const upper = WIN_LOCAL_EXE.toUpperCase();
+    assert.equal(verifyWindowsBinaryPath(upper, ctx({ [upper]: upper })), upper);
+    // .cmd is never executed; it maps to the sibling .exe
+    const cmd = WIN_LOCAL_EXE.replace(/\.exe$/, '.cmd');
+    assert.equal(verifyWindowsBinaryPath(cmd, ctx({ [WIN_LOCAL_EXE]: WIN_LOCAL_EXE })), WIN_LOCAL_EXE);
+    assert.equal(verifyWindowsBinaryPath(cmd, ctx({ [cmd]: cmd })), null);
+  });
+
+  test('Windows: ORCA_CLI_COMMAND wins when valid and falls back when invalid', () => {
+    const custom = 'D:\\Orca\\resources\\bin\\orca.exe';
+    const files = { [custom]: custom, [WIN_LOCAL_EXE]: WIN_LOCAL_EXE };
+    const run = (cmd: string) =>
+      discoverOrcaBinary({
+        platform: 'win32',
+        env: { ...WIN_ENV, ORCA_CLI_COMMAND: cmd },
+        homeDir: null,
+        windowsFs: fakeWindowsFs(files, WIN_DIRS),
+      });
+    assert.equal(run(custom), custom);
+    assert.equal(run('D:\\missing\\orca.exe'), WIN_LOCAL_EXE);
+    assert.equal(run('orca.exe'), WIN_LOCAL_EXE);
+    assert.equal(run('D:\\Orca\\resources\\bin\\orca.ps1'), WIN_LOCAL_EXE);
+  });
+
+  test('Windows env: keeps drive-absolute PATH segments and required runtime vars only', () => {
+    const env = buildMinimalSafeEnv(
+      {
+        PATH: 'C:\\Windows\\System32;relative;\\\\server\\share;C:foo;;D:\\Tools',
+        SystemRoot: 'C:\\Windows',
+        LOCALAPPDATA: WIN_ENV.LOCALAPPDATA,
+        APPDATA: 'C:\\Users\\tester\\AppData\\Roaming',
+        USERPROFILE: 'C:\\Users\\tester',
+        TEMP: 'relative-temp',
+        TMP: 'C:\\Users\\tester\\AppData\\Local\\Temp',
+        ORCA_USER_DATA_PATH: 'C:\\Users\\tester\\AppData\\Roaming\\orca',
+        ORCA_BOT_TOOLS_TOKEN: 'secret',
+        ORCA_CLI_COMMAND: WIN_LOCAL_EXE,
+        GITHUB_TOKEN: 'ghp' + '_secret',
+        ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+      },
+      'win32'
+    );
+    assert.equal(env.PATH, 'C:\\Windows\\System32;D:\\Tools');
+    assert.deepEqual(Object.keys(env).sort(), [
+      'APPDATA',
+      'LOCALAPPDATA',
+      'ORCA_USER_DATA_PATH',
+      'PATH',
+      'SystemRoot',
+      'TMP',
+      'USERPROFILE',
+    ]);
+  });
+
+  test('POSIX env: Windows-only vars excluded, path vars must be absolute', () => {
+    const env = buildMinimalSafeEnv(
+      {
+        PATH: '/usr/bin',
+        SystemRoot: 'C:\\Windows',
+        APPDATA: '/x',
+        XDG_CONFIG_HOME: 'relative',
+        ORCA_USER_DATA_PATH: '/home/jonas/.config/orca',
+      },
+      'linux'
+    );
+    assert.deepEqual(Object.keys(env).sort(), ['ORCA_USER_DATA_PATH', 'PATH']);
+  });
+
+  test('Linux: finds ~/.config/orca/cli/bin/orca (mode 700) and still refuses writable files/dirs', () => {
+    const home = makeTrustedTmp('.tmp-cli-home-');
+    try {
+      const bin = path.join(home, '.config', 'orca', 'cli', 'bin', 'orca');
+      writeExec(bin, 0o700);
+      const ctx = { platform: 'linux' as const, env: {}, homeDir: home };
+      assert.equal(discoverOrcaBinary(ctx), bin);
+
+      // other-writable / group-writable / non-executable binaries are refused
+      for (const mode of [0o702, 0o722, 0o720, 0o600]) {
+        fs.chmodSync(bin, mode);
+        assert.notEqual(discoverOrcaBinary(ctx), bin, `mode ${mode.toString(8)} must be refused`);
+      }
+      fs.chmodSync(bin, 0o700);
+
+      // world-writable ancestor directory is refused
+      const orcaDir = path.join(home, '.config', 'orca');
+      fs.chmodSync(orcaDir, 0o777);
+      assert.notEqual(discoverOrcaBinary(ctx), bin);
+      fs.chmodSync(orcaDir, 0o755);
+
+      // group-writable parent directory is refused
+      const binDir = path.dirname(bin);
+      fs.chmodSync(binDir, 0o775);
+      assert.notEqual(discoverOrcaBinary(ctx), bin);
+      fs.chmodSync(binDir, 0o755);
+
+      // symlink escaping the trusted cli/bin dir is refused
+      const outside = path.join(home, 'elsewhere', 'orca');
+      writeExec(outside, 0o755);
+      fs.rmSync(bin);
+      fs.symlinkSync(outside, bin);
+      assert.notEqual(discoverOrcaBinary(ctx), bin);
+      assert.notEqual(discoverOrcaBinary(ctx), outside);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('POSIX: ORCA_CLI_COMMAND valid/invalid', () => {
+    const dir = makeTrustedTmp('.tmp-cli-env-');
+    try {
+      const bin = path.join(dir, 'custom', 'orca');
+      writeExec(bin, 0o755);
+      const run = (cmd: string | undefined) =>
+        discoverOrcaBinary({ platform: 'linux', env: cmd === undefined ? {} : { ORCA_CLI_COMMAND: cmd }, homeDir: dir });
+
+      assert.equal(run(bin), bin);
+      // relative and missing paths are ignored (fallback never returns them)
+      assert.notEqual(run(path.relative(process.cwd(), bin)), path.relative(process.cwd(), bin));
+      assert.notEqual(run(path.join(dir, 'missing', 'orca')), path.join(dir, 'missing', 'orca'));
+      // directories are refused
+      assert.notEqual(run(path.dirname(bin)), path.dirname(bin));
+      // world-writable binary is refused even when explicitly configured
+      fs.chmodSync(bin, 0o757);
+      assert.notEqual(run(bin), bin);
+      fs.chmodSync(bin, 0o755);
+      // macOS honors ORCA_CLI_COMMAND too
+      assert.equal(
+        discoverOrcaBinary({ platform: 'darwin', env: { ORCA_CLI_COMMAND: bin }, homeDir: dir }),
+        bin
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

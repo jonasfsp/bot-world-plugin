@@ -10,6 +10,14 @@
 
 *Virtual Office, Pocket Pet Terrarium (`G`), Broadcast Chroma Bar (`B`), Creator Studio (`U`), Bot RPG (`V`/`H`/`K`), Quick Send & Decision Reply, Stuck Watchdog, and 24h Digest (`I`) — all running locally inside Orca.*
 
+## Fork note: cross-platform CLI discovery
+
+This is a local fork of upstream v1.0.0 (`1.0.0-autoseller.1`) with one change: `src/orca-cli.ts` now finds the Orca CLI on Windows and Linux too, not only on macOS.
+
+- Discovery order: `ORCA_CLI_COMMAND` (an absolute path to an existing file), then the platform defaults. Windows: `%LOCALAPPDATA%\Programs\Orca\resources\bin\orca.exe`, then `%ProgramFiles%\Orca\resources\bin\orca.exe`. Linux: `${XDG_CONFIG_HOME:-~/.config}/orca/cli/bin/orca`, then `/opt/Orca/resources/bin/orca-ide`. macOS: the same paths as upstream.
+- The POSIX owner/mode/ancestor checks are unchanged. On Windows they are replaced by: a drive-absolute path, a `.exe` file (a `.cmd` path is mapped to the sibling `orca.exe`, never run, because of CVE-2024-27980), an existing regular file, and a realpath inside `%LOCALAPPDATA%` or `%ProgramFiles%` (or equal to `ORCA_CLI_COMMAND`).
+- The command allowlist, argument validation and Quick Send opt-in are unchanged.
+
 ## Quick Start
 
 1. **Install** from the Orca catalog or load locally:
