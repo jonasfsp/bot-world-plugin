@@ -1209,6 +1209,9 @@ function updateDocumentPrefs(patch: Partial<BotWorldDocumentData>): void {
       patch.customDeskPositions ?? { ...(state.docData.customDeskPositions ?? {}) },
     zones: patch.zones ?? [...(state.docData.zones ?? [])],
     showZones: patch.showZones !== undefined ? patch.showZones : (state.docData.showZones !== false),
+    // Written from outside (bot/script); an editor save must never drop them.
+    ...(state.docData.brand ? { brand: state.docData.brand } : {}),
+    ...(state.docData.projectBoard ? { projectBoard: state.docData.projectBoard } : {}),
   };
   state.docData = next;
   if (docSession && !docSession.readOnly) {

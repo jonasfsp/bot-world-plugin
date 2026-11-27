@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "bot-world",
   "name": "Bot World",
-  "version": "1.0.0-autoseller.5",
+  "version": "1.0.0-autoseller.6",
   "description": "Virtual office & Pocket Pet visualizer for Orca bots and live sub-workers (read-only by default, opt-in Quick Send)",
   "license": "MIT",
   "author": {
