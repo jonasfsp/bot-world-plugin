@@ -682,6 +682,10 @@ export type BotState = {
   homeChatId: string | null;
   needsYouCount: number;
   activeWorkerCount: number;
+  /** Orca bot groups this bot belongs to (titles of its `bot-group-member-*` chats). */
+  groups?: string[];
+  /** Paired Orca server the bot lives on (`bot list` → `server.on`); absent for local bots. */
+  server?: string | null;
 };
 
 export type WorkerLiveness = 'Live' | 'Exited' | 'Unverifiable';
@@ -1013,4 +1017,8 @@ export type BotWorldStatePayload = {
   languageSetting: LanguageSetting;
   weeklyTrend?: DailyTrendPoint[];
   creatorUpdatedAtMs?: number;
+  /** Selected bot group ('' = all bots). The snapshot is already scoped to it. */
+  groupFilter?: string;
+  /** Every bot group seen across the full fleet, sorted. */
+  availableGroups?: string[];
 };

@@ -149,6 +149,31 @@ export function applyStatus(snapshot: WorldSnapshot, env: CliEnvelope<unknown>):
   }
 }
 
+const MAX_BOT_GROUPS = 32;
+const MAX_GROUP_NAME_CHARS = 80;
+/** Orca names a bot's seat in a group chat `bot-group-member-<uuid>`; the chat title is the group. */
+export const GROUP_CHAT_ID_PREFIX = 'bot-group-member-';
+
+/** `bot list` → `server: { name, on }` for bots on a paired Orca server; null for local bots. */
+export function parseBotServer(raw: unknown): string | null {
+  const obj = asObj(raw);
+  if (!obj) return null;
+  const on = asStr(obj.on) ?? asStr(obj.name);
+  if (!on) return null;
+  const clean = scrubAll(on).trim();
+  if (clean.length === 0 || clean.length > 128 || clean.startsWith('-')) return null;
+  if (/[\x00-\x1f\x7f]/.test(clean)) return null;
+  return clean;
+}
+
+export function cleanGroupName(raw: unknown): string | null {
+  const title = asStr(raw);
+  if (!title) return null;
+  const clean = scrubAll(title).replace(/[\x00-\x1f\x7f]+/g, ' ').trim();
+  if (clean.length === 0) return null;
+  return clean.length > MAX_GROUP_NAME_CHARS ? clean.slice(0, MAX_GROUP_NAME_CHARS) : clean;
+}
+
 function mergeRawBots(
   snapshot: WorldSnapshot,
   rawBots: unknown[],
@@ -176,6 +201,7 @@ function mergeRawBots(
     const cleanAgent = scrubAll(asStr(raw.agent) ?? '');
     const paused = asBool(raw.paused);
     const cleanSpecialty = scrubAll(asStr(raw.specialty) ?? '');
+    const server = parseBotServer(raw.server);
 
     let entry = safeGet(snapshot.bots, id);
     if (!entry) {
@@ -192,9 +218,11 @@ function mergeRawBots(
         homeChatId: null,
         needsYouCount: 0,
         activeWorkerCount: 0,
+        server,
       };
       safeSet(snapshot.bots, id, entry);
     } else {
+      entry.server = server;
       entry.name = cleanName;
       entry.agent = cleanAgent;
       entry.paused = paused;
@@ -252,6 +280,7 @@ export function applyBotChats(snapshot: WorldSnapshot, env: CliEnvelope<unknown>
   let bestTitleAt: number | null = null;
   let bestTitle: string | null = null;
   let homeChatId: string | null = null;
+  const groups = new Set<string>();
 
   for (const rawChat of asArray(res.chats)) {
     const chat = asObj(rawChat);
@@ -259,6 +288,13 @@ export function applyBotChats(snapshot: WorldSnapshot, env: CliEnvelope<unknown>
     const chatId = asStr(chat.id);
     if (!chatId || !isSafeKey(chatId)) continue;
     safeSet(snapshot.chatIndex, chatId, botId);
+
+    if (chatId.startsWith(GROUP_CHAT_ID_PREFIX)) {
+      // A group seat: its title names the group, not a task.
+      const group = cleanGroupName(chat.title);
+      if (group && !asBool(chat.closed) && groups.size < MAX_BOT_GROUPS) groups.add(group);
+      continue;
+    }
 
     if (asBool(chat.home) && homeChatId === null) {
       homeChatId = chatId;
@@ -290,6 +326,7 @@ export function applyBotChats(snapshot: WorldSnapshot, env: CliEnvelope<unknown>
 
   const bot = safeGet(snapshot.bots, botId);
   if (bot) {
+    bot.groups = [...groups].sort((a, b) => a.localeCompare(b));
     if (homeChatId !== null) {
       bot.homeChatId = homeChatId;
     }

@@ -45,6 +45,10 @@ declare module 'orca' {
       input: { soundMode: SoundMode };
       output: { soundMode: SoundMode };
     };
+    'botWorld.setGroupFilter': {
+      input: { group: string };
+      output: { groupFilter: string };
+    };
     'botWorld.setViewMode': {
       input: { viewMode: ViewMode };
       output: { viewMode: ViewMode };

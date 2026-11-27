@@ -2398,3 +2398,20 @@ html.light .bw-rpg-level-pill {
   max-height: 180px;
   overflow-y: auto;
 }
+
+.bw-group-select {
+  flex: 0 0 auto;
+  max-width: 130px;
+  border: 1px solid var(--bw-input-border);
+  background: var(--bw-input-bg);
+  color: var(--bw-fg);
+  border-radius: 6px;
+  padding: 2px 4px;
+  font-size: 11px;
+  font-family: inherit;
+}
+
+.bw-group-select:focus {
+  outline: none;
+  border-color: var(--bw-accent);
+}

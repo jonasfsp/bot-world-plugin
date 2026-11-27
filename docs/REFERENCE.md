@@ -151,3 +151,12 @@ orca plugin test . --json
 - **`v0.1.2`**: Generalized role-aware avatar matching and 15+ bot overflow seating grid.
 - **`v0.1.1`**: Bilingual English / 한국어 UI (`L` and `language` setting).
 - **`v0.1.0`**: Initial public release with Sidebar Panel, `.botworld` Office Board, Redact Mode (`R`), and 24h timeline replay.
+
+---
+
+## Bot groups (`1.0.0-autoseller.4`)
+
+- The filter bar shows a group picker once Orca reports any bot group. **All groups** shows every bot; a group shows only its bots, their sub-workers and items, in the office, Pocket Pet and Broadcast views. The choice is saved (`botWorld.prefs.groupFilter`) and set with `botWorld.setGroupFilter { group }` (`''` = all).
+- Groups come from `orca bot chats --bot <name> --all`: each `bot-group-member-*` chat is a seat in a group, and its title is the group name. Those chats no longer show up as a bot's task title.
+- Bots on a paired Orca server (`bot list` → `server.on`) are polled with `--environment <server>` on `bot chats` and `bot item list`; the allowlist accepts that flag only there, validated like a bot name.
+- Redact Mode shows `Group #N` instead of group names.

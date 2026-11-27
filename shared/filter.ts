@@ -175,3 +175,65 @@ export function filterBotIds(
   }
   return matched;
 }
+
+/** Every Orca bot group seen across the fleet, sorted and de-duplicated. */
+export function listBotGroups(snapshot: WorldSnapshot): string[] {
+  const groups = new Set<string>();
+  for (const id of orderedSnapshotBotIds(snapshot)) {
+    for (const g of snapshot.bots[id]?.groups ?? []) {
+      if (typeof g === 'string' && g.length > 0) groups.add(g);
+    }
+  }
+  return [...groups].sort((a, b) => a.localeCompare(b));
+}
+
+export function botInGroup(bot: BotState, group: string): boolean {
+  return group === '' || (bot.groups ?? []).includes(group);
+}
+
+/**
+ * The snapshot with only the bots of `group` (and their workers, items and chats).
+ * `group === ''` returns the snapshot unchanged. Everything that renders from the
+ * scoped snapshot (office, pet, broadcast, counts, search) then hides the other bots.
+ */
+export function scopeSnapshotToGroup(snapshot: WorldSnapshot, group: string): WorldSnapshot {
+  if (group === '') return snapshot;
+  const bots: WorldSnapshot['bots'] = {};
+  const keepIds = new Set<string>();
+  const keepNames = new Set<string>();
+  for (const [id, bot] of Object.entries(snapshot.bots)) {
+    if (!isSafeKey(id) || !botInGroup(bot, group)) continue;
+    Object.defineProperty(bots, id, { value: bot, enumerable: true, writable: true, configurable: true });
+    keepIds.add(id);
+    keepNames.add(bot.name);
+  }
+  const pick = <T>(
+    rec: Record<string, T>,
+    keep: (value: T) => boolean
+  ): Record<string, T> => {
+    const out: Record<string, T> = {};
+    for (const [k, v] of Object.entries(rec)) {
+      if (isSafeKey(k) && keep(v)) {
+        Object.defineProperty(out, k, { value: v, enumerable: true, writable: true, configurable: true });
+      }
+    }
+    return out;
+  };
+  return {
+    ...snapshot,
+    bots,
+    botOrder: snapshot.botOrder.filter((id) => keepIds.has(id)),
+    chatIndex: pick(snapshot.chatIndex, (botId) => keepIds.has(botId)),
+    runBotIndex: pick(snapshot.runBotIndex, (botId) => keepIds.has(botId)),
+    workers: pick(
+      snapshot.workers,
+      (w) =>
+        (w.parentBotId !== null && keepIds.has(w.parentBotId)) ||
+        (w.parentBotName !== null && keepNames.has(w.parentBotName))
+    ),
+    items: pick(
+      snapshot.items,
+      (it) => keepIds.has(it.ownerBotId) || keepNames.has(it.ownerBotName)
+    ),
+  };
+}

@@ -858,6 +858,33 @@ export function validateBotName(botName: string): string {
   return trimmed;
 }
 
+/** A paired Orca server selector (`--environment`): same rules as a bot name. */
+export function validateEnvironmentName(environment: string): string {
+  if (typeof environment !== 'string') {
+    throw new OrcaCliError('invalid_argument', 'environment must be a string');
+  }
+  try {
+    return validateBotName(environment);
+  } catch {
+    throw new OrcaCliError('invalid_argument', 'environment contains disallowed characters');
+  }
+}
+
+function environmentArgs(environment?: string | null): string[] {
+  if (environment === undefined || environment === null) return [];
+  return ['--environment', validateEnvironmentName(environment)];
+}
+
+/** Drops a trailing `--environment <name>` (just before `--json`) after validating it. */
+function withoutEnvironment(args: readonly string[]): readonly string[] {
+  const n = args.length;
+  if (n >= 4 && args[n - 3] === '--environment' && args[n - 1] === '--json') {
+    validateEnvironmentName(args[n - 2]);
+    return [...args.slice(0, n - 3), '--json'];
+  }
+  return args;
+}
+
 export function validateSince(since: string): string {
   if (typeof since !== 'string' || !/^[1-9][0-9]{0,3}[smhd]$/.test(since)) {
     throw new OrcaCliError('invalid_argument', 'since must match ^[1-9][0-9]{0,3}[smhd]$');
@@ -916,25 +943,28 @@ export function assertAllowedSubcommand(args: readonly string[]): void {
 
   if (a0 === 'bot' && a1 === 'list' && args.length === 3 && args[2] === '--json') return;
 
+  // bot chats / bot item list may target a paired server with `--environment <name>`.
+  const scoped = a0 === 'bot' && (a1 === 'chats' || a1 === 'item') ? withoutEnvironment(args) : args;
+
   if (
     a0 === 'bot' &&
     a1 === 'chats' &&
-    args.length === 6 &&
-    args[2] === '--bot' &&
-    args[4] === '--all' &&
-    args[5] === '--json'
+    scoped.length === 6 &&
+    scoped[2] === '--bot' &&
+    scoped[4] === '--all' &&
+    scoped[5] === '--json'
   ) {
-    validateBotName(args[3]);
+    validateBotName(scoped[3]);
     return;
   }
 
-  if (a0 === 'bot' && a1 === 'item' && args[2] === 'list' && args[3] === '--bot') {
-    if (args.length === 6 && args[5] === '--json') {
-      validateBotName(args[4]);
+  if (a0 === 'bot' && a1 === 'item' && scoped[2] === 'list' && scoped[3] === '--bot') {
+    if (scoped.length === 6 && scoped[5] === '--json') {
+      validateBotName(scoped[4]);
       return;
     }
-    if (args.length === 7 && args[5] === '--all' && args[6] === '--json') {
-      validateBotName(args[4]);
+    if (scoped.length === 7 && scoped[5] === '--all' && scoped[6] === '--json') {
+      validateBotName(scoped[4]);
       return;
     }
   }
@@ -1070,8 +1100,13 @@ export interface OrcaClient {
   isStopped(): boolean;
   status(): Promise<CliEnvelope<unknown>>;
   botList(): Promise<CliEnvelope<unknown>>;
-  botChats(botName: string): Promise<CliEnvelope<unknown>>;
-  botItemList(botName: string, all: boolean): Promise<CliEnvelope<unknown>>;
+  /** `environment`: the paired Orca server a remote bot lives on (`bot list` → `server.on`). */
+  botChats(botName: string, environment?: string | null): Promise<CliEnvelope<unknown>>;
+  botItemList(
+    botName: string,
+    all: boolean,
+    environment?: string | null
+  ): Promise<CliEnvelope<unknown>>;
   worktreePs(since?: string): Promise<CliEnvelope<unknown>>;
   orchestrationInbox(limit: number): Promise<CliEnvelope<unknown>>;
   orchestrationWorkerList(limit: number, cursor?: string | null): Promise<CliEnvelope<unknown>>;
@@ -1235,18 +1270,35 @@ export class OrcaCli implements OrcaClient {
     return this.runEnvelope(['bot', 'list', '--json']);
   }
 
-  async botChats(botName: string): Promise<CliEnvelope<unknown>> {
+  async botChats(botName: string, environment?: string | null): Promise<CliEnvelope<unknown>> {
     const clean = validateBotName(botName);
-    return this.runEnvelope(['bot', 'chats', '--bot', clean, '--all', '--json']);
+    return this.runEnvelope([
+      'bot',
+      'chats',
+      '--bot',
+      clean,
+      '--all',
+      ...environmentArgs(environment),
+      '--json',
+    ]);
   }
 
-  async botItemList(botName: string, all: boolean): Promise<CliEnvelope<unknown>> {
+  async botItemList(
+    botName: string,
+    all: boolean,
+    environment?: string | null
+  ): Promise<CliEnvelope<unknown>> {
     const clean = validateBotName(botName);
-    return this.runEnvelope(
-      all
-        ? ['bot', 'item', 'list', '--bot', clean, '--all', '--json']
-        : ['bot', 'item', 'list', '--bot', clean, '--json']
-    );
+    return this.runEnvelope([
+      'bot',
+      'item',
+      'list',
+      '--bot',
+      clean,
+      ...(all ? ['--all'] : []),
+      ...environmentArgs(environment),
+      '--json',
+    ]);
   }
 
   async worktreePs(since = '24h'): Promise<CliEnvelope<unknown>> {

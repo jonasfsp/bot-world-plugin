@@ -29,6 +29,7 @@ import {
   clampStuckThresholdMin,
   stuckAlertsSignature,
 } from '../shared/watchdog.ts';
+import { listBotGroups, scopeSnapshotToGroup } from '../shared/filter.ts';
 import { DesktopNotificationManager } from './desktop-notify.ts';
 import {
   diffSnapshots,
@@ -151,7 +152,19 @@ type StoredPrefs = {
   hasViewModeOverride: boolean;
   hasRedactOverride: boolean;
   hasLanguageOverride: boolean;
+  /** Bot group to show ('' = all bots). */
+  groupFilter: string;
 };
+
+const MAX_GROUP_FILTER_CHARS = 80;
+
+/** A group name from the UI or storage: '' (all bots) or a short single-line name. */
+export function sanitizeGroupFilter(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (trimmed.length > MAX_GROUP_FILTER_CHARS || CONTROL_CHAR_RE.test(trimmed)) return null;
+  return trimmed;
+}
 
 export type QuickSendFn = (botName: string, message: string) => Promise<CliEnvelope<unknown>>;
 export type ItemReplyFn = (
@@ -204,6 +217,7 @@ function validatePrefs(
     hasViewModeOverride: false,
     hasRedactOverride: false,
     hasLanguageOverride: false,
+    groupFilter: '',
   };
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return base;
@@ -236,6 +250,7 @@ function validatePrefs(
     base.languageSetting = clean.languageSetting;
     base.hasLanguageOverride = clean.hasLanguageOverride === true;
   }
+  base.groupFilter = sanitizeGroupFilter(clean.groupFilter) ?? '';
   if (clean.botAppearances && typeof clean.botAppearances === 'object' && !Array.isArray(clean.botAppearances)) {
     const map = new Map<string, CharacterId>();
     for (const [botId, charId] of Object.entries(clean.botAppearances as Record<string, unknown>)) {
@@ -614,6 +629,7 @@ export class BotWorldWorkerController {
     hasViewModeOverride: false,
     hasRedactOverride: false,
     hasLanguageOverride: false,
+    groupFilter: '',
   };
   private pollIntervalSec = 5;
   private hostLocale = 'en';
@@ -844,9 +860,11 @@ export class BotWorldWorkerController {
     const redact = this.prefs.redactMode;
     const locale = this.currentLocale();
     const s = tStrings(locale);
-    const safeSnapshot = prepareSnapshotForUi(this.session.snapshot, redact, locale);
+    const groupFilter = this.prefs.groupFilter;
+    const scopedSnapshot = scopeSnapshotToGroup(this.session.snapshot, groupFilter);
+    const safeSnapshot = prepareSnapshotForUi(scopedSnapshot, redact, locale);
     const trendNowMs = this.session.snapshot.capturedAt > 0 ? this.session.snapshot.capturedAt : Date.now();
-    const stuckAlerts = this.watchdogTracker.getAlerts(this.session.snapshot, {
+    const stuckAlerts = this.watchdogTracker.getAlerts(scopedSnapshot, {
       thresholdMin: this.lastSettings.stuckThresholdMin,
       nowMs: this.nowMs(),
       redactMode: redact,
@@ -873,6 +891,8 @@ export class BotWorldWorkerController {
       languageSetting: this.prefs.languageSetting,
       weeklyTrend: getLastSevenDaysTrend(this.weeklyTrendStore.days, trendNowMs),
       creatorUpdatedAtMs: this.creatorStore.updatedAtMs,
+      groupFilter,
+      availableGroups: listBotGroups(this.session.snapshot),
     };
 
     const baseBytes = utf8ByteLength(payload);
@@ -914,7 +934,7 @@ export class BotWorldWorkerController {
     });
     const safeKeyframes = keyframes.map((kf) => ({
       timestampMs: kf.timestampMs,
-      snapshot: prepareSnapshotForUi(kf.snapshot, redact, locale),
+      snapshot: prepareSnapshotForUi(scopeSnapshotToGroup(kf.snapshot, groupFilter), redact, locale),
     }));
 
     payload.events = safeEvents;
@@ -1391,6 +1411,21 @@ export class BotWorldWorkerController {
         await this.persistPrefs();
         this.postStateUpdated();
         return { soundMode: this.prefs.soundMode };
+      }),
+
+      this.orca.panels.handle('botWorld.setGroupFilter', async (input) => {
+        if (!input || typeof input !== 'object' || Array.isArray(input)) {
+          throw makeHostError('invalid_params', 'input must be an object');
+        }
+        const clean = stripDangerousKeys(input as Record<string, unknown>);
+        const group = sanitizeGroupFilter(clean.group);
+        if (group === null) {
+          throw makeHostError('invalid_params', 'Invalid group');
+        }
+        this.prefs.groupFilter = group;
+        await this.persistPrefs();
+        this.postStateUpdated();
+        return { groupFilter: this.prefs.groupFilter };
       }),
 
       this.orca.panels.handle('botWorld.setViewMode', async (input) => {

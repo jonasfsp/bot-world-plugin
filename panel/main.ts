@@ -61,6 +61,7 @@ import {
   isFilterActive,
   orderedSnapshotBotIds,
 } from '../shared/filter.ts';
+import { createGroupSelect } from '../shared/group-select.ts';
 import { effectiveLocale, getHostLocale, resolveUiLocale, tStrings } from '../shared/i18n.ts';
 import { setButtonContent, svgIcon } from '../shared/icons.ts';
 import { MilestoneTracker, MotionDirector, ReplayController } from '../shared/motion.ts';
@@ -520,11 +521,29 @@ const searchClearBtn = el(
 ) as HTMLButtonElement;
 
 const filterMatchPill = el('span', { className: 'bw-filter-match-pill bw-hidden' }, '0/0');
+const groupSelect = createGroupSelect((group) => void setGroupFilterValue(group).catch(() => {}));
+
+async function setGroupFilterValue(group: string): Promise<void> {
+  if (isDemoMode()) return;
+  state.selectedBotId = null;
+  state.selectionCleared = false;
+  state.payload = { ...state.payload, groupFilter: group };
+  livePayload = state.payload;
+  renderUi();
+  try {
+    const res = await orca.plugin.request('botWorld.setGroupFilter', { group });
+    state.payload = { ...state.payload, groupFilter: res.groupFilter };
+    livePayload = state.payload;
+    renderUi();
+  } catch {
+    // The next state update from the worker carries the saved choice.
+  }
+}
 const filterBar = el(
   'div',
   { className: 'bw-filter-bar bw-filter-bar-compact' },
   filterChipsWrap,
-  el('div', { className: 'bw-filter-search-wrap' }, filterMatchPill, searchInput, searchClearBtn)
+  el('div', { className: 'bw-filter-search-wrap' }, groupSelect.element, filterMatchPill, searchInput, searchClearBtn)
 );
 
 const botStrip = el('div', { className: 'bw-bot-strip' });
@@ -1996,6 +2015,12 @@ function renderUi(): void {
       ? snap.capturedAt
       : Date.now();
 
+  groupSelect.update({
+    groups: isDemoMode() ? [] : (state.payload.availableGroups ?? []),
+    selected: isDemoMode() ? '' : (state.payload.groupFilter ?? ''),
+    redactMode,
+    locale,
+  });
   const counts = countFilterPresets(snap);
   for (const preset of STATUS_FILTER_PRESETS) {
     const btn = filterChipButtons.get(preset);

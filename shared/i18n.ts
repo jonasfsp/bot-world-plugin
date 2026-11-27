@@ -325,6 +325,9 @@ export type UiDictionary = {
   collabButtonTitle: string;
   filterPresetLabels: Record<'all' | 'working' | 'needs_you' | 'error' | 'workers', string>;
   searchPlaceholder: string;
+  groupAll: string;
+  groupSelectLabel: string;
+  groupAlias: (n: number) => string;
   searchClearTitle: string;
   filterMatchCount: (matched: number, total: number) => string;
   sectionBadges: string;
@@ -807,6 +810,9 @@ export const UI_STRINGS: Readonly<Record<UiLocale, UiDictionary>> = {
       workers: 'Workers',
     },
     searchPlaceholder: 'Search bots… [/]',
+    groupAll: 'All groups',
+    groupSelectLabel: 'Show only this bot group',
+    groupAlias: (n) => `Group #${n}`,
     searchClearTitle: 'Clear search [Esc]',
     filterMatchCount: (matched, total) => `${matched}/${total}`,
     sectionBadges: 'Office Badges (24h)',
@@ -1361,6 +1367,9 @@ export const UI_STRINGS: Readonly<Record<UiLocale, UiDictionary>> = {
       workers: '워커 보유',
     },
     searchPlaceholder: '봇 검색… [/]',
+    groupAll: '모든 그룹',
+    groupSelectLabel: '이 봇 그룹만 표시',
+    groupAlias: (n) => `그룹 #${n}`,
     searchClearTitle: '검색 지우기 [Esc]',
     filterMatchCount: (matched, total) => `${matched}/${total}`,
     sectionBadges: '오피스 배지 (24h)',

@@ -364,7 +364,7 @@ async function pollSlowTier(
     const bot = botId && Object.hasOwn(snapshot.bots, botId) ? snapshot.bots[botId] : undefined;
     if (bot) {
       try {
-        const items = await cli.botItemList(bot.name, true);
+        const items = await cli.botItemList(bot.name, true, bot.server ?? null);
         applyBotItemsScoped(snapshot, items, true);
       } catch (err) {
         if (err instanceof OrcaCliError && err.code === 'stopped') throw err;
@@ -461,11 +461,11 @@ async function pollMediumTier(
 ): Promise<void> {
   if (snapshot.botOrder.length === 0) return;
 
-  const targets: Array<{ id: string; name: string }> = [];
+  const targets: Array<{ id: string; name: string; server: string | null }> = [];
   if (allOnBoot) {
     for (const id of snapshot.botOrder) {
       const bot = Object.hasOwn(snapshot.bots, id) ? snapshot.bots[id] : undefined;
-      if (bot) targets.push({ id: bot.id, name: bot.name });
+      if (bot) targets.push({ id: bot.id, name: bot.name, server: bot.server ?? null });
     }
   } else {
     const len = snapshot.botOrder.length;
@@ -474,7 +474,7 @@ async function pollMediumTier(
       const idx = (botCursor * 2 + offset) % len;
       const id = snapshot.botOrder[idx];
       const bot = id && Object.hasOwn(snapshot.bots, id) ? snapshot.bots[id] : undefined;
-      if (bot) targets.push({ id: bot.id, name: bot.name });
+      if (bot) targets.push({ id: bot.id, name: bot.name, server: bot.server ?? null });
     }
   }
 
@@ -484,14 +484,15 @@ async function pollMediumTier(
   type BotFetchPair = {
     id: string;
     name: string;
+    server: string | null;
     itemsRes: PromiseSettledResult<Awaited<ReturnType<OrcaClient['botItemList']>>>;
     chatsRes: PromiseSettledResult<Awaited<ReturnType<OrcaClient['botChats']>>>;
   };
 
   const tasks: Array<() => Promise<unknown>> = [];
   for (const t of targets) {
-    tasks.push(() => cli.botItemList(t.name, false));
-    tasks.push(() => cli.botChats(t.name));
+    tasks.push(() => cli.botItemList(t.name, false, t.server));
+    tasks.push(() => cli.botChats(t.name, t.server));
   }
   const rawResults = await runWithConcurrency(tasks, MAX_CONCURRENT_CLI);
 
@@ -500,12 +501,13 @@ async function pollMediumTier(
     pairs.push({
       id: targets[i].id,
       name: targets[i].name,
+      server: targets[i].server,
       itemsRes: rawResults[i * 2] as PromiseSettledResult<Awaited<ReturnType<OrcaClient['botItemList']>>>,
       chatsRes: rawResults[i * 2 + 1] as PromiseSettledResult<Awaited<ReturnType<OrcaClient['botChats']>>>,
     });
   }
 
-  for (const { id: botId, name: botName, itemsRes, chatsRes } of pairs) {
+  for (const { id: botId, name: botName, server: botServer, itemsRes, chatsRes } of pairs) {
     if (itemsRes.status === 'fulfilled') {
       const items = itemsRes.value;
       const res =
@@ -534,7 +536,7 @@ async function pollMediumTier(
         );
       if (hadDisappearedOpen) {
         try {
-          const allItems = await cli.botItemList(botName, true);
+          const allItems = await cli.botItemList(botName, true, botServer);
           applyBotItemsScoped(snapshot, allItems, true);
         } catch {
           applyBotItemsScoped(snapshot, items, false);
