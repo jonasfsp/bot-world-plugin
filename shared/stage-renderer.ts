@@ -373,6 +373,15 @@ export type StageRenderInput = {
 /** A board snapshot older than this is labelled stale instead of looking current. */
 export const PROJECT_BOARD_STALE_MS = 26 * 60 * 60 * 1000;
 const MAX_BOARD_ROWS = 6;
+/**
+ * Movable office props. Their positions live in `customDeskPositions` under these keys
+ * (design coordinates), so they are dragged, saved, merged and reset like bot desks.
+ * Brand: bottom-centre of the wall sign. Board: top-left corner.
+ */
+export const PROP_BRAND_ID = 'prop:brand';
+export const PROP_BOARD_ID = 'prop:board';
+const BRAND_SIGN_HEIGHT = 46; // design px
+const BRAND_SIGN_DEPTH = 7; // extrusion layers
 
 type HitBox = {
   botId: string;
@@ -413,6 +422,9 @@ export class StageRenderer {
   private lastStageViewport: StageViewport | null = null;
   private hitBoxes: HitBox[] = [];
   private dragCandidate: DragCandidate | null = null;
+  private propHitBoxes: Array<{ id: string; rect: Rect }> = [];
+  private readonly propAnchors = new Map<string, DeskCoordinate>();
+  private readonly silhouetteCache = new Map<string, HTMLCanvasElement>();
   private panDrag: PanDragState | null = null;
   private suppressNextClick = false;
   private rafId: number | null = null;
@@ -801,6 +813,29 @@ export class StageRenderer {
     this.ensureAnimationLoopIfNeeded();
   };
 
+  private findHitPropId(clientX: number, clientY: number): string | null {
+    const rect = this.canvas.getBoundingClientRect();
+    const x = clientX - rect.left;
+    const y = clientY - rect.top;
+    for (let i = this.propHitBoxes.length - 1; i >= 0; i--) {
+      const [rx, ry, rw, rh] = this.propHitBoxes[i].rect;
+      if (x >= rx && x <= rx + rw && y >= ry && y <= ry + rh) {
+        return this.propHitBoxes[i].id;
+      }
+    }
+    return null;
+  }
+
+  /** Where a prop sits now: mid-drag position, saved position, or the theme default. */
+  private propAnchor(id: string, fallback: DeskCoordinate, input: StageRenderInput): DeskCoordinate {
+    const drag = this.dragCandidate;
+    const saved = input.customDeskPositions?.[id];
+    const pos =
+      drag && drag.isDragging && drag.botId === id ? drag.currentPos : (saved ?? fallback);
+    this.propAnchors.set(id, pos);
+    return pos;
+  }
+
   private findHitBotId(clientX: number, clientY: number): string | null {
     const rect = this.canvas.getBoundingClientRect();
     const x = clientX - rect.left;
@@ -856,6 +891,26 @@ export class StageRenderer {
 
   private readonly handlePointerDown = (ev: PointerEvent): void => {
     if (ev.button !== 0 || !this.lastInput) return;
+    const propId = this.onMoveBot ? this.findHitPropId(ev.clientX, ev.clientY) : null;
+    const propAnchor = propId ? this.propAnchors.get(propId) : undefined;
+    if (propId && propAnchor) {
+      this.dragCandidate = {
+        botId: propId,
+        pointerId: ev.pointerId,
+        startClientX: ev.clientX,
+        startClientY: ev.clientY,
+        startDesignX: propAnchor.x,
+        startDesignY: propAnchor.y,
+        isDragging: false,
+        currentPos: { ...propAnchor },
+      };
+      try {
+        this.canvas.setPointerCapture?.(ev.pointerId);
+      } catch {
+        // Ignore capture errors in non-DOM/synthetic environments
+      }
+      return;
+    }
     const botId = this.findHitBotId(ev.clientX, ev.clientY);
     if (botId && this.onMoveBot) {
       const desk = this.lastInput.motion.layout.botDesks.get(botId);
@@ -935,6 +990,11 @@ export class StageRenderer {
     }
 
     const hovered = this.findHitBotId(ev.clientX, ev.clientY);
+    if (!hovered && this.onMoveBot && this.findHitPropId(ev.clientX, ev.clientY)) {
+      this.canvas.style.cursor = 'grab';
+      this.onHoverBot?.(null);
+      return;
+    }
     this.canvas.style.cursor = hovered
       ? this.onMoveBot
         ? 'grab'
@@ -1794,16 +1854,34 @@ export class StageRenderer {
     }
 
     const bounds: Rect = [bgLeft, bgTop, bgRight - bgLeft, bgBottom - bgTop];
+    this.propHitBoxes = [];
     if (input.brand) {
-      const brandRect = this.paintBrand(ctx, input.brand, landmarkRects[0], uiScale, bounds, input.redactMode);
-      if (brandRect) obstacles.push(brandRect);
+      const anchor = this.propAnchor(
+        PROP_BRAND_ID,
+        { x: theme.bossDesk.x, y: Math.max(130, theme.bossDesk.y - 70) },
+        input
+      );
+      const brandRect = this.paintBrand(ctx, vt, input.brand, anchor, bounds, input.redactMode);
+      if (brandRect) {
+        obstacles.push(brandRect);
+        this.propHitBoxes.push({ id: PROP_BRAND_ID, rect: brandRect });
+      }
     }
     if (input.projectBoard) {
       const nowMs = input.displayTimestampMs ?? Date.now();
-      obstacles.push(
-        this.paintProjectBoard(ctx, input.projectBoard, landmarkRects[2], uiScale, bounds, input.redactMode, nowMs, s)
+      const anchor = this.propAnchor(
+        PROP_BOARD_ID,
+        { x: theme.automationBoard.x - 40, y: Math.max(130, theme.automationBoard.y - 10) },
+        input
       );
+      const [ax, ay] = designToScreen(vt, anchor.x, anchor.y);
+      const boardRect = this.paintProjectBoard(
+        ctx, input.projectBoard, [ax, ay, 0, 0], uiScale, bounds, input.redactMode, nowMs, s
+      );
+      obstacles.push(boardRect);
+      this.propHitBoxes.push({ id: PROP_BOARD_ID, rect: boardRect });
     }
+    void landmarkRects;
 
     // Desk mini-props
     for (const dp of deskProps) {
@@ -2771,46 +2849,92 @@ export class StageRenderer {
     return [left, top, estW, estH];
   }
 
-  /** Logo plaque above the boss desk label; falls back to the company name. */
+  /**
+   * Company sign: the logo as a raised acrylic wall sign (extruded edge, soft shadow),
+   * scaled with the office so it reads as part of the room. Falls back to the name.
+   */
   private paintBrand(
     ctx: CanvasRenderingContext2D,
+    vt: ViewportTransform,
     rawBrand: BrandInfo,
-    anchor: Rect,
-    uiScale: number,
+    anchor: DeskCoordinate,
     bounds: Rect,
     redactMode: boolean
   ): Rect | null {
     const brand = sanitizeBrand(rawBrand);
     if (!brand) return null;
     const img = !redactMode && brand.logo ? this.loadImage(brand.logo) : null;
-    const h = 26 * uiScale;
-    const pad = 6 * uiScale;
-    ctx.font = `800 ${Math.round(12 * uiScale)}px ${CANVAS_FONT_FAMILY}`;
+    const scale = vt.scale;
+    const h = BRAND_SIGN_HEIGHT * scale;
+    const depth = Math.max(2, BRAND_SIGN_DEPTH * scale);
     const label = redactMode ? '★' : brand.name;
-    const w = img
-      ? (h - pad) * (img.naturalWidth / Math.max(1, img.naturalHeight)) + pad * 2
-      : ctx.measureText(label).width + pad * 2;
+    const font = `900 ${Math.round(h * 0.62)}px ${CANVAS_FONT_FAMILY}`;
+    ctx.font = font;
+    const w = img ? h * (img.naturalWidth / Math.max(1, img.naturalHeight)) : ctx.measureText(label).width;
+    const [cx, cy] = designToScreen(vt, anchor.x, anchor.y);
     const [bx, by, bw, bh] = bounds;
-    const left = Math.max(bx + 4, Math.min(bx + bw - w - 4, anchor[0] + anchor[2] * 0.5 - w * 0.5));
-    const top = Math.max(by + 4, Math.min(by + bh - h - 4, anchor[1] - h - 4 * uiScale));
-    drawRoundedRect(ctx, left, top, w, h, 7 * uiScale);
-    ctx.fillStyle = 'rgba(8, 14, 38, 0.82)';
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(120, 170, 255, 0.55)';
-    ctx.lineWidth = 1;
-    ctx.stroke();
+    const left = Math.max(bx + 4, Math.min(bx + bw - w - depth - 4, cx - w * 0.5));
+    const top = Math.max(by + 4, Math.min(by + bh - h - depth - 4, cy - h));
+
+    ctx.save();
+    // Shadow cast on the wall behind the sign.
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.45)';
+    ctx.shadowBlur = 10 * scale;
+    ctx.shadowOffsetX = depth * 0.9;
+    ctx.shadowOffsetY = depth * 1.3;
+    const silhouette = img ? this.logoSilhouette(brand.logo!, img, 'rgb(20, 24, 70)') : null;
+    // Extruded edge: stacked dark copies stepping down-right, the face on top.
+    for (let i = Math.ceil(depth); i >= 1; i--) {
+      if (i === Math.ceil(depth) - 1) {
+        ctx.shadowColor = 'transparent';
+      }
+      if (silhouette) {
+        ctx.globalAlpha = 0.55 + 0.45 * (1 - i / depth);
+        ctx.drawImage(silhouette, left + i * 0.55, top + i * 0.75, w, h);
+      } else {
+        ctx.fillStyle = `rgba(20, 24, 70, ${0.55 + 0.45 * (1 - i / depth)})`;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+        ctx.fillText(label, left + i * 0.55, top + i * 0.75 + h * 0.18);
+      }
+    }
+    ctx.globalAlpha = 1;
+    ctx.shadowColor = 'rgba(120, 170, 255, 0.35)';
+    ctx.shadowBlur = 6 * scale;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
     if (img) {
-      ctx.drawImage(img, left + pad, top + pad * 0.5, w - pad * 2, h - pad);
+      ctx.drawImage(img, left, top, w, h);
     } else {
       ctx.fillStyle = '#ffffff';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(label, left + w * 0.5, top + h * 0.5);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.fillText(label, left, top + h * 0.18);
     }
-    return [left, top, w, h];
+    ctx.restore();
+    return [left, top, w + depth, h + depth];
   }
 
-  /** Project list with backlog counts, hung under the Automation Board label. */
+  /** A flat, single-colour copy of the logo used for its extruded edge (cached per logo). */
+  private logoSilhouette(key: string, img: HTMLImageElement, color: string): HTMLCanvasElement | null {
+    const cached = this.silhouetteCache.get(key);
+    if (cached) return cached;
+    if (typeof document === 'undefined') return null;
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth;
+    c.height = img.naturalHeight;
+    const cctx = c.getContext('2d');
+    if (!cctx) return null;
+    cctx.drawImage(img, 0, 0);
+    cctx.globalCompositeOperation = 'source-in';
+    cctx.fillStyle = color;
+    cctx.fillRect(0, 0, c.width, c.height);
+    if (this.silhouetteCache.size > 4) this.silhouetteCache.clear();
+    this.silhouetteCache.set(key, c);
+    return c;
+  }
+
+  /** Project list with backlog counts; `anchor` is its top-left corner on screen. */
   private paintProjectBoard(
     ctx: CanvasRenderingContext2D,
     board: ProjectBoard,
@@ -2834,7 +2958,7 @@ export class StageRenderer {
     const h = pad + headH + (Math.max(1, rows.length) + extra) * rowH + footH + pad * 0.5;
     const [bx, by, bw, bh] = bounds;
     const left = Math.max(bx + 4, Math.min(bx + bw - w - 4, anchor[0]));
-    const top = Math.max(by + 4, Math.min(by + bh - h - 4, anchor[1] + anchor[3] + 4 * uiScale));
+    const top = Math.max(by + 4, Math.min(by + bh - h - 4, anchor[1]));
 
     drawRoundedRect(ctx, left, top, w, h, 8 * uiScale);
     ctx.fillStyle = 'rgba(14, 10, 34, 0.86)';

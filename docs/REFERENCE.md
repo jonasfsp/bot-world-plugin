@@ -182,3 +182,4 @@ A `.botworld` board can carry two optional sections, written by a bot or script 
 - **Project board**: hangs under the Automation Board, showing up to 6 projects with a backlog bar and count, the total, and the source with its time. A snapshot older than 26 h is shown as out of date.
 - Edits made outside the editor (for example `fabrica.py clickup board --botworld <file>`) merge into an open board; saving from the editor keeps both sections.
 - Redact Mode shows `Project #N` and hides the logo.
+- `1.0.0-autoseller.7`: the logo is a larger raised wall sign (extruded edge, wall shadow) that scales with the office; drag the sign or the project board to move them. Their positions are saved in `customDeskPositions` as `prop:brand` (sign bottom-centre) and `prop:board` (board top-left), and **Reset Seats** puts them back.
