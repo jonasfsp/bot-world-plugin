@@ -1,3 +1,4 @@
+import { type BrandInfo, type ProjectBoard, sanitizeBrand, sanitizeProjectBoard } from './project-board.ts';
 export type UiLocale = 'en' | 'ko';
 export type LanguageSetting = 'auto' | 'en' | 'ko';
 
@@ -466,6 +467,10 @@ export type BotWorldDocumentData = {
   customDeskPositions?: Record<string, DeskCoordinate>;
   zones?: TeamZone[];
   showZones?: boolean;
+  /** Company name and logo, written by a script or bot (see project-board.ts). */
+  brand?: BrandInfo;
+  /** Projects and their backlog, written by a script or bot (see project-board.ts). */
+  projectBoard?: ProjectBoard;
 };
 
 export const DEFAULT_BOTWORLD_DOCUMENT: BotWorldDocumentData = {
@@ -573,6 +578,8 @@ export function validateBotWorldDocument(
     const customDeskPositions = sanitizeCustomDeskPositions(rec.customDeskPositions);
     const zones = rec.zones !== undefined ? sanitizeTeamZones(rec.zones) : fallbackZones;
     const showZones = typeof rec.showZones === 'boolean' ? rec.showZones : fallbackShowZones;
+    const brand = sanitizeBrand(rec.brand);
+    const projectBoard = sanitizeProjectBoard(rec.projectBoard);
 
     return {
       data: {
@@ -586,6 +593,8 @@ export function validateBotWorldDocument(
         customDeskPositions,
         zones,
         showZones,
+        ...(brand ? { brand } : {}),
+        ...(projectBoard ? { projectBoard } : {}),
       },
       valid: true,
     };

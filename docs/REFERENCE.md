@@ -160,3 +160,25 @@ orca plugin test . --json
 - Groups come from `orca bot chats --bot <name> --all`: each `bot-group-member-*` chat is a seat in a group, and its title is the group name. Those chats no longer show up as a bot's task title.
 - Bots on a paired Orca server (`bot list` → `server.on`) are polled with `--environment <server>` on `bot chats` and `bot item list`; the allowlist accepts that flag only there, validated like a bot name.
 - Redact Mode shows `Group #N` instead of group names.
+
+---
+
+## Company brand & project board (`1.0.0-autoseller.5`)
+
+A `.botworld` board can carry two optional sections, written by a bot or script outside the plugin (the plugin never calls a tracker and holds no credentials):
+
+```json
+{
+  "brand": { "name": "Stacx", "logo": "data:image/png;base64,..." },
+  "projectBoard": {
+    "updatedAt": "2026-11-27T18:23:23Z",
+    "source": "ClickUp · Engenharia",
+    "projects": [{ "name": "[VoxOS]", "backlog": 20, "todo": 2, "inProgress": 2, "toTest": 15 }]
+  }
+}
+```
+
+- **Brand**: the logo plaque hangs above the boss desk (PNG/JPEG/WebP data URL up to 120 KiB; anything else falls back to the name).
+- **Project board**: hangs under the Automation Board, showing up to 6 projects with a backlog bar and count, the total, and the source with its time. A snapshot older than 26 h is shown as out of date.
+- Edits made outside the editor (for example `fabrica.py clickup board --botworld <file>`) merge into an open board; saving from the editor keeps both sections.
+- Redact Mode shows `Project #N` and hides the logo.

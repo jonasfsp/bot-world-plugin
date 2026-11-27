@@ -326,6 +326,11 @@ export type UiDictionary = {
   filterPresetLabels: Record<'all' | 'working' | 'needs_you' | 'error' | 'workers', string>;
   searchPlaceholder: string;
   groupAll: string;
+  projectBoardTitle: string;
+  projectBoardTotal: (n: number) => string;
+  projectBoardEmpty: string;
+  projectBoardMore: (n: number) => string;
+  projectBoardStale: (when: string) => string;
   groupSelectLabel: string;
   groupAlias: (n: number) => string;
   searchClearTitle: string;
@@ -811,6 +816,11 @@ export const UI_STRINGS: Readonly<Record<UiLocale, UiDictionary>> = {
     },
     searchPlaceholder: 'Search bots… [/]',
     groupAll: 'All groups',
+    projectBoardTitle: 'Projects · backlog',
+    projectBoardTotal: (n) => `${n} total`,
+    projectBoardEmpty: 'No backlog',
+    projectBoardMore: (n) => `+${n} more`,
+    projectBoardStale: (when) => `Out of date · ${when}`,
     groupSelectLabel: 'Show only this bot group',
     groupAlias: (n) => `Group #${n}`,
     searchClearTitle: 'Clear search [Esc]',
@@ -1368,6 +1378,11 @@ export const UI_STRINGS: Readonly<Record<UiLocale, UiDictionary>> = {
     },
     searchPlaceholder: '봇 검색… [/]',
     groupAll: '모든 그룹',
+    projectBoardTitle: '프로젝트 · 백로그',
+    projectBoardTotal: (n) => `총 ${n}`,
+    projectBoardEmpty: '백로그 없음',
+    projectBoardMore: (n) => `+${n}개 더`,
+    projectBoardStale: (when) => `오래된 데이터 · ${when}`,
     groupSelectLabel: '이 봇 그룹만 표시',
     groupAlias: (n) => `그룹 #${n}`,
     searchClearTitle: '검색 지우기 [Esc]',

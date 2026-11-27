@@ -1046,6 +1046,8 @@ function syncOwnerRoamLoop(): void {
             redactMode,
             botAppearances: appearances,
             customDeskPositions: activeCustomPositions(),
+            brand: isDemoMode() ? null : (state.docData.brand ?? null),
+            projectBoard: isDemoMode() ? null : (state.docData.projectBoard ?? null),
             rpgProfiles: activeRpgProfiles(),
             ownerAvatar: {
               roaming: ownerAvatar.roaming,
@@ -2213,6 +2215,8 @@ function renderStageFrame(
       redactMode,
       botAppearances: appearances,
       customDeskPositions: activeCustomPositions(),
+            brand: isDemoMode() ? null : (state.docData.brand ?? null),
+            projectBoard: isDemoMode() ? null : (state.docData.projectBoard ?? null),
       rpgProfiles: activeRpgProfiles(),
       ownerAvatar: {
         roaming: ownerAvatar.roaming,

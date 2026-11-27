@@ -18,6 +18,7 @@ import {
   toPlainSafeRecord,
   validateBotWorldDocument,
 } from '../src/types.ts';
+import { sameJson, sanitizeBrand, sanitizeProjectBoard } from '../src/project-board.ts';
 
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
 
@@ -155,6 +156,16 @@ export function mergeBotWorldDocuments(
   const outShowZones = typeof outside?.showZones === 'boolean' ? outside.showZones : baseShowZones;
   const showZones = mineShowZones !== baseShowZones ? mineShowZones : outShowZones;
 
+  // Brand and project board are written from outside (a bot/script); keep a local change only
+  // if this editor made one.
+  const pickOutside = <T>(clean: (v: unknown) => T | undefined, key: 'brand' | 'projectBoard'): T | undefined => {
+    const b = clean(base?.[key]);
+    const m = clean(mine?.[key]);
+    return !sameJson(m, b) ? m : clean(outside?.[key]);
+  };
+  const brand = pickOutside(sanitizeBrand, 'brand');
+  const projectBoard = pickOutside(sanitizeProjectBoard, 'projectBoard');
+
   return {
     version: 1,
     themeId,
@@ -166,6 +177,8 @@ export function mergeBotWorldDocuments(
     customDeskPositions: toPlainSafeRecord(mergedPositions),
     zones,
     showZones,
+    ...(brand ? { brand } : {}),
+    ...(projectBoard ? { projectBoard } : {}),
   };
 }
 
@@ -194,6 +207,10 @@ export function encodeBotWorldContent(data: BotWorldDocumentData): { kind: 'text
     zones: sanitizeTeamZones(data.zones),
     showZones: typeof data.showZones === 'boolean' ? data.showZones : true,
   };
+  const brand = sanitizeBrand(data.brand);
+  const projectBoard = sanitizeProjectBoard(data.projectBoard);
+  if (brand) safeDoc.brand = brand;
+  if (projectBoard) safeDoc.projectBoard = projectBoard;
   return {
     kind: 'text',
     text: `${JSON.stringify(safeDoc, null, 2)}\n`,

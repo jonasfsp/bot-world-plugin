@@ -40,6 +40,13 @@ import {
 } from './camera.ts';
 import type { CollabEdge } from './collab-network.ts';
 import { validateCustomAssetDataUrl } from './creator-studio.ts';
+import {
+  type BrandInfo,
+  type ProjectBoard,
+  boardProjectLabels,
+  boardTotals,
+  sanitizeBrand,
+} from '../src/project-board.ts';
 import { tStrings } from './i18n.ts';
 import {
   type BubbleKind,
@@ -357,7 +364,15 @@ export type StageRenderInput = {
   customBackground?: string | null;
   customAvatars?: Readonly<Record<string, string>>;
   stuckAlerts?: readonly StuckAlert[];
+  /** Company logo/name shown at the boss desk (from the .botworld document). */
+  brand?: BrandInfo | null;
+  /** Projects and backlog shown under the Automation Board (from the .botworld document). */
+  projectBoard?: ProjectBoard | null;
 };
+
+/** A board snapshot older than this is labelled stale instead of looking current. */
+export const PROJECT_BOARD_STALE_MS = 26 * 60 * 60 * 1000;
+const MAX_BOARD_ROWS = 6;
 
 type HitBox = {
   botId: string;
@@ -1771,9 +1786,23 @@ export class StageRenderer {
       [theme.officeDoor.x, theme.officeDoor.y - 30, `▸ ${theme.officeDoor.label}`, 'rgba(28, 118, 156, 0.92)'],
       [theme.automationBoard.x, theme.automationBoard.y - 26, `◷ ${theme.automationBoard.label}`, 'rgba(98, 48, 166, 0.92)'],
     ];
+    const landmarkRects: Rect[] = [];
     for (const [lx, ly, label, bg] of landmarks) {
       const rect = this.paintLandmark(ctx, vt, lx, ly, label, bg, uiScale, bgLeft, bgTop, bgRight, bgBottom);
       obstacles.push(rect);
+      landmarkRects.push(rect);
+    }
+
+    const bounds: Rect = [bgLeft, bgTop, bgRight - bgLeft, bgBottom - bgTop];
+    if (input.brand) {
+      const brandRect = this.paintBrand(ctx, input.brand, landmarkRects[0], uiScale, bounds, input.redactMode);
+      if (brandRect) obstacles.push(brandRect);
+    }
+    if (input.projectBoard) {
+      const nowMs = input.displayTimestampMs ?? Date.now();
+      obstacles.push(
+        this.paintProjectBoard(ctx, input.projectBoard, landmarkRects[2], uiScale, bounds, input.redactMode, nowMs, s)
+      );
     }
 
     // Desk mini-props
@@ -2742,6 +2771,137 @@ export class StageRenderer {
     return [left, top, estW, estH];
   }
 
+  /** Logo plaque above the boss desk label; falls back to the company name. */
+  private paintBrand(
+    ctx: CanvasRenderingContext2D,
+    rawBrand: BrandInfo,
+    anchor: Rect,
+    uiScale: number,
+    bounds: Rect,
+    redactMode: boolean
+  ): Rect | null {
+    const brand = sanitizeBrand(rawBrand);
+    if (!brand) return null;
+    const img = !redactMode && brand.logo ? this.loadImage(brand.logo) : null;
+    const h = 26 * uiScale;
+    const pad = 6 * uiScale;
+    ctx.font = `800 ${Math.round(12 * uiScale)}px ${CANVAS_FONT_FAMILY}`;
+    const label = redactMode ? '★' : brand.name;
+    const w = img
+      ? (h - pad) * (img.naturalWidth / Math.max(1, img.naturalHeight)) + pad * 2
+      : ctx.measureText(label).width + pad * 2;
+    const [bx, by, bw, bh] = bounds;
+    const left = Math.max(bx + 4, Math.min(bx + bw - w - 4, anchor[0] + anchor[2] * 0.5 - w * 0.5));
+    const top = Math.max(by + 4, Math.min(by + bh - h - 4, anchor[1] - h - 4 * uiScale));
+    drawRoundedRect(ctx, left, top, w, h, 7 * uiScale);
+    ctx.fillStyle = 'rgba(8, 14, 38, 0.82)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(120, 170, 255, 0.55)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    if (img) {
+      ctx.drawImage(img, left + pad, top + pad * 0.5, w - pad * 2, h - pad);
+    } else {
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, left + w * 0.5, top + h * 0.5);
+    }
+    return [left, top, w, h];
+  }
+
+  /** Project list with backlog counts, hung under the Automation Board label. */
+  private paintProjectBoard(
+    ctx: CanvasRenderingContext2D,
+    board: ProjectBoard,
+    anchor: Rect,
+    uiScale: number,
+    bounds: Rect,
+    redactMode: boolean,
+    nowMs: number,
+    s: ReturnType<typeof tStrings>
+  ): Rect {
+    const labels = boardProjectLabels(board, redactMode);
+    const rows = board.projects.slice(0, MAX_BOARD_ROWS);
+    const totals = boardTotals(board);
+    const maxBacklog = Math.max(1, ...rows.map((p) => p.backlog));
+    const rowH = 15 * uiScale;
+    const headH = 18 * uiScale;
+    const footH = 14 * uiScale;
+    const pad = 7 * uiScale;
+    const w = 196 * uiScale;
+    const extra = board.projects.length > MAX_BOARD_ROWS ? 1 : 0;
+    const h = pad + headH + (Math.max(1, rows.length) + extra) * rowH + footH + pad * 0.5;
+    const [bx, by, bw, bh] = bounds;
+    const left = Math.max(bx + 4, Math.min(bx + bw - w - 4, anchor[0]));
+    const top = Math.max(by + 4, Math.min(by + bh - h - 4, anchor[1] + anchor[3] + 4 * uiScale));
+
+    drawRoundedRect(ctx, left, top, w, h, 8 * uiScale);
+    ctx.fillStyle = 'rgba(14, 10, 34, 0.86)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(160, 120, 255, 0.55)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = `800 ${Math.round(10.5 * uiScale)}px ${CANVAS_FONT_FAMILY}`;
+    ctx.fillText(s.projectBoardTitle, left + pad, top + pad + headH * 0.5);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#ffd36b';
+    ctx.fillText(s.projectBoardTotal(totals.backlog), left + w - pad, top + pad + headH * 0.5);
+
+    let y = top + pad + headH;
+    ctx.font = `600 ${Math.round(9.5 * uiScale)}px ${CANVAS_FONT_FAMILY}`;
+    if (rows.length === 0) {
+      ctx.textAlign = 'left';
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.fillText(s.projectBoardEmpty, left + pad, y + rowH * 0.5);
+      y += rowH;
+    }
+    const countW = 26 * uiScale;
+    const nameW = w - pad * 2 - countW - 4 * uiScale;
+    rows.forEach((p, i) => {
+      const cy = y + rowH * 0.5;
+      // Backlog bar behind the name, proportional to the busiest project.
+      const barW = Math.max(2, nameW * (p.backlog / maxBacklog));
+      drawRoundedRect(ctx, left + pad, y + 2 * uiScale, barW, rowH - 4 * uiScale, 3 * uiScale);
+      ctx.fillStyle = 'rgba(124, 92, 255, 0.35)';
+      ctx.fill();
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#eef0ff';
+      ctx.fillText(fitText(ctx, labels[i] ?? '', nameW - 4 * uiScale), left + pad + 3 * uiScale, cy);
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#ffd36b';
+      ctx.fillText(String(p.backlog), left + w - pad, cy);
+      y += rowH;
+    });
+    if (extra) {
+      ctx.textAlign = 'left';
+      ctx.fillStyle = 'rgba(255,255,255,0.6)';
+      ctx.fillText(s.projectBoardMore(board.projects.length - MAX_BOARD_ROWS), left + pad, y + rowH * 0.5);
+      y += rowH;
+    }
+
+    const updated = Date.parse(board.updatedAt);
+    const stale = !Number.isFinite(updated) || nowMs - updated > PROJECT_BOARD_STALE_MS;
+    const when = Number.isFinite(updated)
+      ? new Date(updated).toLocaleString(undefined, {
+          day: '2-digit',
+          month: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+        })
+      : '?';
+    ctx.font = `500 ${Math.round(8.5 * uiScale)}px ${CANVAS_FONT_FAMILY}`;
+    ctx.textAlign = 'left';
+    ctx.fillStyle = stale ? '#ffb347' : 'rgba(255,255,255,0.55)';
+    const foot = stale ? s.projectBoardStale(when) : `${board.source ? `${board.source} · ` : ''}${when}`;
+    ctx.fillText(fitText(ctx, foot, w - pad * 2), left + pad, y + footH * 0.5);
+    return [left, top, w, h];
+  }
+
   private paintCarryProp(
     ctx: CanvasRenderingContext2D,
     prop: CarryProp,
@@ -3387,4 +3547,17 @@ export class StageRenderer {
     this.bgCacheCtx = null;
     this.bgCacheKey = '';
   }
+}
+
+/** Truncates `text` with an ellipsis so it fits `maxW` pixels in the current font. */
+function fitText(ctx: CanvasRenderingContext2D, text: string, maxW: number): string {
+  if (ctx.measureText(text).width <= maxW) return text;
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (ctx.measureText(`${text.slice(0, mid)}…`).width <= maxW) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo > 0 ? `${text.slice(0, lo)}…` : '…';
 }
